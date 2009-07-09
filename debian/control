@@ -9,7 +9,7 @@ Package: shellinabox
 Section: web
 Architecture: any
 Depends: ${shlibs:Depends}, adduser
-Recommends: libssl0.9.8, libpam0g, openssl
+Recommends: libssl-dev, libpam0g-dev, openssl
 Description: publish command line shell through AJAX interface
  Shellinabox can export arbitrary command line programs to any JavaScript
  enabled web browser. By default, it prompts for username and password
