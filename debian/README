@@ -24,3 +24,8 @@ root login incorrect:
       "auth  requisite  pam_securetty.so", which disallows root logins
       except on tty's listed in /etc/securetty
 
+    - solutions:
+        - login as regular user and use su / sudo
+        - disable pam_securetty
+        - add pts/X to /etc/securetty
+
