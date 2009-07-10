@@ -1,7 +1,26 @@
-The list of files here isn't complete.  For a step-by-step guide on
-how to set this package up correctly, check out
-    http://www.debian.org/doc/maint-guide/
+Daemon configuration options: /etc/default/shellinabox
 
-Most of the files that are in this directory are boilerplate.
-However, you may need to change the list of binary-arch dependencies
-in 'rules'.
+    SHELLINABOX_DATADIR (default: /var/lib/shellinabox)
+    SHELLINABOX_USER    (default: shellinabox)
+    SHELLINABOX_GROUP   (default: shellinabox)
+    SHELLINABOX_PORT    (default: 4200)
+
+SSL/TLS support:
+
+    - requires packages specified in recommends
+    - if browser negotiates SNI, daemon will look for matching
+      certificate-SERVERNAME.pem in SHELLINABOX_DATADIR, and will
+      fallback to certificate.pem
+
+      note: SHELLINABOX_USER/GROUP needs read permission on the
+      certificate
+
+root login incorrect:
+
+    - if root login is incorrect (ie. password is not requested), this
+      might be due to your securetty configuration.
+
+    - securetty is enabled in /etc/pam.d/login, under the setting
+      "auth  requisite  pam_securetty.so", which disallows root logins
+      except on tty's listed in /etc/securetty
+
