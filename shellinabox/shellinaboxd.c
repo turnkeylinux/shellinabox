@@ -72,25 +72,28 @@
 #include "shellinabox/privileges.h"
 #include "shellinabox/service.h"
 #include "shellinabox/session.h"
+#include "shellinabox/usercss.h"
 
 #define PORTNUM           4200
 #define MAX_RESPONSE      2048
 
-static int     port;
-static int     portMin;
-static int     portMax;
-static int     localhostOnly = 0;
-static int     noBeep        = 0;
-static int     numericHosts  = 0;
-static int     enableSSL     = 1;
-static int     enableSSLMenu = 1;
-static int     linkifyURLs   = 1;
-static char    *certificateDir;
-static int     certificateFd = -1;
-static HashMap *externalFiles;
-static Server  *cgiServer;
-static char    *cgiSessionKey;
-static int     cgiSessions;
+static int            port;
+static int            portMin;
+static int            portMax;
+static int            localhostOnly = 0;
+static int            noBeep        = 0;
+static int            numericHosts  = 0;
+static int            enableSSL     = 1;
+static int            enableSSLMenu = 1;
+static int            linkifyURLs   = 1;
+static char           *certificateDir;
+static int            certificateFd = -1;
+static HashMap        *externalFiles;
+static Server         *cgiServer;
+static char           *cgiSessionKey;
+static int            cgiSessions;
+static char           *cssStyleSheet;
+static struct UserCSS *userCSSList;
 
 static char *jsonEscape(const char *buf, int len) {
   static const char *hexDigit = "0123456789ABCDEF";
@@ -338,6 +341,7 @@ static int dataHandler(HttpConnection *http, struct Service *service,
   const char *width       = getFromHashMap(args, "width");
   const char *height      = getFromHashMap(args, "height");
   const char *keys        = getFromHashMap(args, "keys");
+  const char *rootURL     = getFromHashMap(args, "rooturl");
 
   // Adjust window dimensions if provided by client
   if (width && height) {
@@ -347,14 +351,20 @@ static int dataHandler(HttpConnection *http, struct Service *service,
 
   // Create a new session, if the client did not provide an existing one
   if (isNew) {
-    if (cgiServer && cgiSessions++) {
-      serverExitLoop(cgiServer, 1);
+    if (keys) {
+    bad_new_session:
       abandonSession(session);
       httpSendReply(http, 400, "Bad Request", NO_MSG);
       return HTTP_DONE;
     }
+
+    if (cgiServer && cgiSessions++) {
+      serverExitLoop(cgiServer, 1);
+      goto bad_new_session;
+    }
     session->http         = http;
-    if (launchChild(service->id, session) < 0) {
+    if (launchChild(service->id, session,
+                    rootURL && *rootURL ? rootURL : urlGetURL(url)) < 0) {
       abandonSession(session);
       httpSendReply(http, 500, "Internal Error", NO_MSG);
       return HTTP_DONE;
@@ -437,18 +447,133 @@ static int dataHandler(HttpConnection *http, struct Service *service,
 
 static void serveStaticFile(HttpConnection *http, const char *contentType,
                             const char *start, const char *end) {
+  char *body                     = (char *)start;
+  char *bodyEnd                  = (char *)end;
+
+  // Unfortunately, there are still some browsers that are so buggy that they
+  // need special conditional code. In anything that has a "text" MIME type,
+  // we allow simple conditionals. Nested conditionals are not supported.
+  if (!memcmp(contentType, "text/", 5)) {
+    char *tag                    = NULL;
+    int condTrue                 = -1;
+    char *ifPtr                  = NULL;
+    char *elsePtr                = NULL;
+    for (char *ptr = body; bodyEnd - ptr >= 6; ) {
+      char *eol                  = ptr;
+      eol                        = memchr(eol, '\n', bodyEnd - eol);
+      if (eol == NULL) {
+        eol                      = bodyEnd;
+      } else {
+        ++eol;
+      }
+      if (!memcmp(ptr, "[if ", 4)) {
+        char *bracket            = memchr(ptr + 4, ']', eol - ptr - 4);
+        if (bracket != NULL && bracket > ptr + 4) {
+          check(tag              = malloc(bracket - ptr - 3));
+          memcpy(tag, ptr + 4, bracket - ptr - 4);
+          tag[bracket - ptr - 4] = '\000';
+          condTrue               = 0;
+          const char *userAgent  = getFromHashMap(httpGetHeaders(http),
+                                                  "user-agent");
+          if (!userAgent) {
+            userAgent            = "";
+          }
+
+          // Allow multiple comma separated conditions. Conditions are either
+          // substrings found in the user agent, or they are "DEFINES_..."
+          // tags at the top of user CSS files.
+          for (char *tagPtr = tag; *tagPtr; ) {
+            char *e              = strchr(tagPtr, ',');
+            if (!e) {
+              e                  = strchr(tag, '\000');
+            } else {
+              *e++               = '\000';
+            }
+            condTrue             = userCSSGetDefine(tagPtr) ||
+                                   strstr(userAgent, tagPtr) != NULL;
+            if (*e) {
+              e[-1]              = ',';
+            }
+            if (condTrue) {
+              break;
+            }
+            tagPtr               = e;
+          }
+
+          // If we find any conditionals, then we need to make a copy of
+          // the text document. We do this lazily, as presumably the majority
+          // of text documents won't have conditionals.
+          if (body == start) {
+            check(body           = malloc(end - start));
+            memcpy(body, start, end - start);
+            bodyEnd             += body - start;
+            ptr                 += body - start;
+            eol                 += body - start;
+          }
+
+          // Remember the beginning of the "[if ...]" statement
+          ifPtr                  = ptr;
+        }
+      } else if (ifPtr && !elsePtr && eol - ptr >= strlen(tag) + 7 &&
+                 !memcmp(ptr, "[else ", 6) &&
+                 !memcmp(ptr + 6, tag, strlen(tag)) &&
+                 ptr[6 + strlen(tag)] == ']') {
+        // Found an "[else ...]" statement. Remember where it started.
+        elsePtr                  = ptr;
+      } else if (ifPtr && eol - ptr >= strlen(tag) + 8 &&
+                 !memcmp(ptr, "[endif ", 7) &&
+                 !memcmp(ptr + 7, tag, strlen(tag)) &&
+                 ptr[7 + strlen(tag)] == ']') {
+        // Found the closing "[endif ...]" statement. Now we can remove those
+        // parts of the conditionals that do not apply to this user agent.
+        char *s, *e;
+        if (condTrue) {
+          s                      = strchr(ifPtr, '\n') + 1;
+          e                      = elsePtr ? elsePtr : ptr;
+        } else {
+          if (elsePtr) {
+            s                    = strchr(elsePtr, '\n') + 1;
+            e                    = ptr;
+          } else {
+            s                    = ifPtr;
+            e                    = ifPtr;
+          }
+        }
+        memmove(ifPtr, s, e - s);
+        memmove(ifPtr + (e - s), eol, bodyEnd - eol);
+        bodyEnd                 -= (s - ifPtr) + (eol - e);
+        eol                      = ifPtr + (e - s);
+        ifPtr                    = NULL;
+        elsePtr                  = NULL;
+        free(tag);
+        tag                      = NULL;
+      }
+      ptr                        = eol;
+    }
+    free(tag);
+  }
+
   char *response   = stringPrintf(NULL,
                                   "HTTP/1.1 200 OK\r\n"
                                   "Content-Type: %s\r\n"
                                   "Content-Length: %ld\r\n"
-                                  "\r\n",
-                                  contentType, (long)(end - start));
+                                  "%s\r\n",
+                                  contentType, (long)(bodyEnd - body),
+                                  body == start ? "" :
+                                  "Cache-Control: no-cache\r\n");
   int len          = strlen(response);
   if (strcmp(httpGetMethod(http), "HEAD")) {
-    check(response = realloc(response, len + (end - start)));
-    memcpy(response + len, start, end - start);
-    len           += end - start;
+    check(response = realloc(response, len + (bodyEnd - body)));
+    memcpy(response + len, body, bodyEnd - body);
+    len           += bodyEnd - body;
   }
+
+  // If we expanded conditionals, we had to create a temporary copy. Delete
+  // it now.
+  if (body != start) {
+    free(body);
+  }
+
   httpTransfer(http, response, len);
 }
 
@@ -478,36 +603,37 @@ static int shellInABoxHttpHandler(HttpConnection *http, void *arg,
   }
   int pathInfoLength      = endPathInfo - pathInfo;
 
-  // The root page either serves the AJAX application or redirects to the
-  // secure HTTPS URL.
   if (!pathInfoLength ||
-      (pathInfoLength == 5 && !memcmp(pathInfo, "plain", 5))) {
+      (pathInfoLength == 5 && !memcmp(pathInfo, "plain", 5)) ||
+      (pathInfoLength == 6 && !memcmp(pathInfo, "secure", 6))) {
+    // The root page serves the AJAX application.
     if (contentType &&
         !strncasecmp(contentType, "application/x-www-form-urlencoded", 33)) {
       // XMLHttpRequest carrying data between the AJAX application and the
       // client session.
       return dataHandler(http, arg, buf, len, url);
     }
-    if (enableSSL && !pathInfoLength && strcmp(urlGetProtocol(url), "https")) {
-      httpSendReply(http, 200, "Shell In A Box",
-                    "<script type=\"text/javascript\"><!--\n"
-                      "document.location.replace("
-                        "document.location.href.replace(/^http:/,'https:'));\n"
-                      "--></script>\n"
-                      "<noscript>\n"
-                        "JavaScript must be enabled for ShellInABox\n"
-                      "</noscript>");
-    } else {
-      extern char rootPageStart[];
-      extern char rootPageEnd[];
-      serveStaticFile(http, "text/html; charset=utf-8",
-                      rootPageStart, rootPageEnd);
-    }
+    extern char rootPageStart[];
+    extern char rootPageEnd[];
+    char *rootPage;
+    check(rootPage = malloc(rootPageEnd - rootPageStart + 1));
+    memcpy(rootPage, rootPageStart, rootPageEnd - rootPageStart);
+    rootPage[rootPageEnd - rootPageStart] = '\000';
+    char *html            = stringPrintf(NULL, rootPage,
+                                         enableSSL ? "true" : "false");
+    serveStaticFile(http, "text/html", html, strrchr(html, '\000'));
+    free(html);
+    free(rootPage);
   } else if (pathInfoLength == 8 && !memcmp(pathInfo, "beep.wav", 8)) {
     // Serve the audio sample for the console bell.
     extern char beepStart[];
     extern char beepEnd[];
     serveStaticFile(http, "audio/x-wav", beepStart, beepEnd);
+  } else if (pathInfoLength == 11 && !memcmp(pathInfo, "enabled.gif", 11)) {
+    // Serve the checkmark icon used in the context menu
+    extern char enabledStart[];
+    extern char enabledEnd[];
+    serveStaticFile(http, "image/gif", enabledStart, enabledEnd);
   } else if (pathInfoLength == 11 && !memcmp(pathInfo, "favicon.ico", 11)) {
     // Serve the favicon
     extern char faviconStart[];
@@ -520,15 +646,18 @@ static int shellInABoxHttpHandler(HttpConnection *http, void *arg,
     extern char vt100End[];
     extern char shellInABoxStart[];
     extern char shellInABoxEnd[];
+    char *userCSSString   = getUserCSSString(userCSSList);
     char *stateVars       = stringPrintf(NULL,
                                          "serverSupportsSSL = %s;\n"
                                          "disableSSLMenu    = %s;\n"
                                          "suppressAllAudio  = %s;\n"
-                                         "linkifyURLs       = %d;\n\n",
+                                         "linkifyURLs       = %d;\n"
+                                         "userCSSList       = %s;\n\n",
                                          enableSSL      ? "true" : "false",
                                          !enableSSLMenu ? "true" : "false",
                                          noBeep         ? "true" : "false",
-                                         linkifyURLs);
+                                         linkifyURLs, userCSSString);
+    free(userCSSString);
     int stateVarsLength   = strlen(stateVars);
     int contentLength     = stateVarsLength +
                             (addr(vt100End) - addr(vt100Start)) +
@@ -553,9 +682,26 @@ static int shellInABoxHttpHandler(HttpConnection *http, void *arg,
     httpTransfer(http, response, headerLength + contentLength);
   } else if (pathInfoLength == 10 && !memcmp(pathInfo, "styles.css", 10)) {
     // Serve the style sheet.
-    extern char stylesStart[];
-    extern char stylesEnd[];
-    serveStaticFile(http, "text/css; charset=utf-8", stylesStart, stylesEnd);
+    serveStaticFile(http, "text/css; charset=utf-8",
+                    cssStyleSheet, strrchr(cssStyleSheet, '\000'));
+  } else if (pathInfoLength == 16 && !memcmp(pathInfo, "print-styles.css",16)){
+    // Serve the style sheet.
+    extern char printStylesStart[];
+    extern char printStylesEnd[];
+    serveStaticFile(http, "text/css; charset=utf-8",
+                    printStylesStart, printStylesEnd);
+  } else if (pathInfoLength > 8 && !memcmp(pathInfo, "usercss-", 8)) {
+    // Server user style sheets (if any)
+    struct UserCSS *css   = userCSSList;
+    for (int idx          = atoi(pathInfo + 8);
+         idx-- > 0 && css; css = css->next ) {
+    }
+    if (css) {
+      serveStaticFile(http, "text/css; charset=utf-8",
+                      css->style, css->style + css->styleLen);
+    } else {
+      httpSendReply(http, 404, "File not found", NO_MSG);
+    }
   } else {
     httpSendReply(http, 404, "File not found", NO_MSG);
   }
@@ -594,6 +740,7 @@ static void usage(void) {
           "List of command line options:\n"
           "  -b, --background[=PIDFILE]  run in background\n"
           "%s"
+          "      --css=FILE              attach contents to CSS style sheet\n"
           "      --cgi[=PORTMIN-PORTMAX] run as CGI\n"
           "  -d, --debug                 enable debug mode\n"
           "  -f, --static-file=URL:FILE  serve static file from URL path\n"
@@ -608,16 +755,18 @@ static void usage(void) {
           "%s"
           "  -q, --quiet                 turn off all messages\n"
           "  -u, --user=UID              switch to this user (default: %s)\n"
+          "      --user-css=STYLES       defines user-selectable CSS options\n"
           "  -v, --verbose               enable logging messages\n"
           "      --version               prints version information\n"
           "\n"
           "Debug, quiet, and verbose are mutually exclusive.\n"
           "\n"
           "One or more --service arguments define services that should "
-          "be made available \n"
+          "be made available\n"
           "through the web interface:\n"
           "  SERVICE := <url-path> ':' APP\n"
-          "  APP     := 'LOGIN' | USER ':' CWD ':' <cmdline>\n"
+          "  APP     := 'LOGIN' | 'SSH' [ : <host> ] | "
+                        "USER ':' CWD ':' <cmdline>\n"
           "  USER    := %s<username> ':' <groupname>\n"
           "  CWD     := 'HOME' | <dir>\n"
           "\n"
@@ -629,7 +778,19 @@ static void usage(void) {
           "  ${lines}   - number of rows\n"
           "  ${peer}    - name of remote peer\n"
           "  ${uid}     - user id\n"
-          "  ${user}    - user name",
+          "  ${url}     - the URL that serves the terminal session\n"
+          "  ${user}    - user name\n"
+          "\n"
+          "One or more --user-css arguments define optional user-selectable "
+          "CSS options.\n"
+          "These options show up in the right-click context menu:\n"
+          "  STYLES  := GROUP { ';' GROUP }*\n"
+          "  GROUP   := OPTION { ',' OPTION }*\n"
+          "  OPTION  := <label> ':' [ '-' | '+' ] <css-file>\n"
+          "\n"
+          "OPTIONs that make up a GROUP are mutually exclusive. But "
+          "individual GROUPs are\n"
+          "independent of each other.\n",
           !serverSupportsSSL() ? "" :
           "  -c, --cert=CERTDIR          set certificate dir "
           "(default: $PWD)\n"
@@ -659,6 +820,12 @@ static void parseArgs(int argc, char * const argv[]) {
   int verbosity            = MSG_DEFAULT;
   externalFiles            = newHashMap(destroyExternalFileHashEntry, NULL);
   HashMap *serviceTable    = newHashMap(destroyServiceHashEntry, NULL);
+  extern char stylesStart[];
+  extern char stylesEnd[];
+  check(cssStyleSheet      = malloc(stylesEnd - stylesStart + 1));
+  memcpy(cssStyleSheet, stylesStart, stylesEnd - stylesStart);
+  cssStyleSheet[stylesEnd - stylesStart] = '\000';
+
   for (;;) {
     static const char optstring[] = "+hb::c:df:g:np:s:tqu:v";
     static struct option options[] = {
@@ -666,6 +833,7 @@ static void parseArgs(int argc, char * const argv[]) {
       { "background",       2, 0, 'b' },
       { "cert",             1, 0, 'c' },
       { "cert-fd",          1, 0,  0  },
+      { "css",              1, 0,  0  },
       { "cgi",              2, 0,  0  },
       { "debug",            0, 0, 'd' },
       { "static-file",      1, 0, 'f' },
@@ -680,6 +848,7 @@ static void parseArgs(int argc, char * const argv[]) {
       { "disable-ssl-menu", 0, 0,  0  },
       { "quiet",            0, 0, 'q' },
       { "user",             1, 0, 'u' },
+      { "user-css",         1, 0,  0  },
       { "verbose",          0, 0, 'v' },
       { "version",          0, 0,  0  },
       { 0,                  0, 0,  0  } };
@@ -698,7 +867,7 @@ static void parseArgs(int argc, char * const argv[]) {
     if (idx-- <= 0) {
       // Help (or invalid argument)
       usage();
-      if (idx == -1) {
+      if (idx < -1) {
         fatal("Failed to parse command line");
       }
       exit(0);
@@ -711,7 +880,7 @@ static void parseArgs(int argc, char * const argv[]) {
       if (optarg && pidfile) {
         fatal("Only one pidfile can be given");
       }
-      if (optarg) {
+      if (optarg && *optarg) {
         pidfile            = strdup(optarg);
       }
     } else if (!idx--) {
@@ -725,6 +894,10 @@ static void parseArgs(int argc, char * const argv[]) {
       if (certificateDir) {
         fatal("Only one certificate directory can be selected");
       }
+      struct stat st;
+      if (!optarg || !*optarg || stat(optarg, &st) || !S_ISDIR(st.st_mode)) {
+        fatal("\"--cert\" expects a directory name");
+      }
       check(certificateDir = strdup(optarg));
     } else if (!idx--) {
       // Certificate file descriptor
@@ -737,12 +910,35 @@ static void parseArgs(int argc, char * const argv[]) {
       if (certificateFd >= 0) {
         fatal("Only one certificate file handle can be provided");
       }
+      if (!optarg || *optarg < '0' || *optarg > '9') {
+        fatal("\"--cert-fd\" expects a valid file handle");
+      }
       int tmpFd            = strtoint(optarg, 3, INT_MAX);
       certificateFd        = dup(tmpFd);
       if (certificateFd < 0) {
         fatal("Invalid certificate file handle");
       }
       check(!NOINTR(close(tmpFd)));
+    } else if (!idx--) {
+      // CSS
+      struct stat st;
+      if (!optarg || !*optarg || stat(optarg, &st) || !S_ISREG(st.st_mode)) {
+        fatal("\"--css\" expects a file name");
+      }
+      FILE *css            = fopen(optarg, "r");
+      if (!css) {
+        fatal("Cannot read style sheet \"%s\"", optarg);
+      } else {
+        check(cssStyleSheet= realloc(cssStyleSheet, strlen(cssStyleSheet) +
+                                     st.st_size + 2));
+        char *newData      = strrchr(cssStyleSheet, '\000');
+        *newData++         = '\n';
+        if (fread(newData, 1, st.st_size, css) != st.st_size) {
+          fatal("Failed to read style sheet \"%s\"", optarg);
+        }
+        newData[st.st_size]= '\000';
+        fclose(css);
+      }
     } else if (!idx--) {
       // CGI
       if (demonize) {
@@ -752,7 +948,7 @@ static void parseArgs(int argc, char * const argv[]) {
         fatal("Cannot specify a port for CGI operation");
       }
       cgi                  = 1;
-      if (optarg) {
+      if (optarg && *optarg) {
         char *ptr          = strchr(optarg, '-');
         if (!ptr) {
           fatal("Syntax error in port range specification");
@@ -788,6 +984,9 @@ static void parseArgs(int argc, char * const argv[]) {
       if (runAsGroup >= 0) {
         fatal("Duplicate --group option.");
       }
+      if (!optarg || !*optarg) {
+        fatal("\"--group\" expects a group name.");
+      }
       runAsGroup           = parseGroup(optarg, NULL);
     } else if (!idx--) {
       // Linkify
@@ -817,6 +1016,9 @@ static void parseArgs(int argc, char * const argv[]) {
       }
       if (cgi) {
         fatal("Cannot specifiy a port for CGI operation");
+      }
+      if (!optarg || *optarg < '0' || *optarg > '9') {
+        fatal("\"--port\" expects a port number.");
       }
       port = strtoint(optarg, 1, 65535);
     } else if (!idx--) {
@@ -852,7 +1054,16 @@ static void parseArgs(int argc, char * const argv[]) {
       if (runAsUser >= 0) {
         fatal("Duplicate --user option.");
       }
+      if (!optarg || !*optarg) {
+        fatal("\"--user\" expects a user name.");
+      }
       runAsUser            = parseUser(optarg, NULL);
+    } else if (!idx--) {
+      // User CSS
+      if (!optarg || !*optarg) {
+        fatal("\"--user-css\" expects a list of styles sheets and labels");
+      }
+      parseUserCSS(&userCSSList, optarg);
     } else if (!idx--) {
       // Verbose
       if (!logIsDefault() && (!logIsInfo() || logIsDebug())) {
@@ -885,7 +1096,8 @@ static void parseArgs(int argc, char * const argv[]) {
 
   // If the user did not register any services, provide the default service
   if (!getHashmapSize(serviceTable)) {
-    addToHashMap(serviceTable, "/", (char *)newService(":LOGIN"));
+    addToHashMap(serviceTable, "/", (char *)newService(geteuid() ? ":SSH" :
+                                                                   ":LOGIN"));
   }
   enumerateServices(serviceTable);
   deleteHashMap(serviceTable);
@@ -1021,7 +1233,7 @@ int main(int argc, char * const argv[]) {
     printf("X-ShellInABox-Port: %d\r\n"
            "X-ShellInABox-Pid: %d\r\n"
            "Content-type: text/html; charset=utf-8\r\n\r\n",
-           port, pid);
+           port, getpid());
     printfUnchecked(cgiRoot, port, cgiSessionKey);
     fflush(stdout);
     free(cgiRoot);
@@ -1031,7 +1243,8 @@ int main(int argc, char * const argv[]) {
   }
 
   // Set log file format
-  serverSetNumericHosts(server, numericHosts);
+  serverSetNumericHosts(server, numericHosts ||
+                        logIsQuiet() || logIsDefault());
 
   // Disable /quit handler
   serverRegisterHttpHandler(server, "/quit", NULL, NULL);

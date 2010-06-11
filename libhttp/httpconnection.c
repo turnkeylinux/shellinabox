@@ -48,6 +48,7 @@
 
 #include <errno.h>
 #include <arpa/inet.h>
+#include <math.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <stdio.h>
@@ -58,9 +59,15 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#ifdef HAVE_ZLIB
+#include <zlib.h>
+#endif
+
 #ifdef HAVE_STRLCAT
 #define strncat(a,b,c) ({ char *_a = (a); strlcat(_a, (b), (c)+1); _a; })
 #endif
+#define max(a, b) ({ typeof(a) _a = (a); typeof(b) _b = (b);                  \
+                     _a > _b ? _a : _b; })
 
 #include "libhttp/httpconnection.h"
 #include "logging/logging.h"
@@ -414,15 +421,151 @@ void deleteHttpConnection(struct HttpConnection *http) {
   free(http);
 }
 
+#ifdef HAVE_ZLIB
+static int httpAcceptsEncoding(struct HttpConnection *http,
+                               const char *encoding) {
+  int encodingLength  = strlen(encoding);
+  const char *accepts = getFromHashMap(&http->header, "accept-encoding");
+  if (!accepts) {
+    return 0;
+  }
+  double all          = -1.0;
+  double match        = -1.0;
+  while (*accepts) {
+    while (*accepts == ' ' || *accepts == '\t' ||
+           *accepts == '\r' || *accepts == '\n') {
+      accepts++;
+    }
+    const char *ptr   = accepts;
+    while (*ptr && *ptr != ',' && *ptr != ';' &&
+           *ptr != ' ' && *ptr != '\t' &&
+           *ptr != '\r' && *ptr != '\n') {
+      ptr++;
+    }
+    int isAll         = ptr - accepts == 1 && *accepts == '*';
+    int isMatch       = ptr - accepts == encodingLength &&
+                        !strncasecmp(accepts, encoding, encodingLength);
+    while (*ptr && *ptr != ';' && *ptr != ',') {
+      ptr++;
+    }
+    double val        = 1.0;
+    if (*ptr == ';') {
+      ptr++;
+      while (*ptr == ' ' || *ptr == '\t' || *ptr == '\r' || *ptr == '\n') {
+        ptr++;
+      }
+      if ((*ptr | 0x20) == 'q') {
+        ptr++;
+        while (*ptr == ' ' || *ptr == '\t' || *ptr == '\r' || *ptr == '\n') {
+          ptr++;
+        }
+        if (*ptr == '=') {
+          val         = strtod(ptr + 1, (char **)&ptr);
+        }
+      }
+    }
+    if (isnan(val) || val == -HUGE_VAL || val < 0) {
+      val             = 0;
+    } else if (val == HUGE_VAL || val > 1.0) {
+      val             = 1.0;
+    }
+    if (isAll) {
+      all             = val;
+    } else if (isMatch) {
+      match           = val;
+    }
+    while (*ptr && *ptr != ',') {
+      ptr++;
+    }
+    while (*ptr == ',') {
+      ptr++;
+    }
+    accepts           = ptr;
+  }
+  if (match >= 0.0) {
+    return match > 0.0;
+  } else {
+    return all > 0.0;
+  }
+}
+#endif
+
+static void removeHeader(char *header, int *headerLength, const char *id) {
+  check(header);
+  check(headerLength);
+  check(*headerLength >= 0);
+  check(id);
+  check(strchr(id, ':'));
+  int idLength       = strlen(id);
+  if (idLength <= 0) {
+    return;
+  }
+  for (char *ptr = header; header + *headerLength - ptr >= idLength; ) {
+    char *end        = ptr;
+    do {
+      end            = memchr(end, '\n', header + *headerLength - end);
+      if (end == NULL) {
+        end          = header + *headerLength;
+      } else {
+        ++end;
+      }
+    } while (end < header + *headerLength && *end == ' ');
+    if (!strncasecmp(ptr, id, idLength)) {
+      memmove(ptr, end, header + *headerLength - end);
+      *headerLength -= end - ptr;
+    } else {
+      ptr            = end;
+    }
+  }
+}
+
+static void addHeader(char **header, int *headerLength, const char *fmt, ...) {
+  check(header);
+  check(headerLength);
+  check(*headerLength >= 0);
+  check(strstr(fmt, "\r\n"));
+
+  va_list ap;
+  va_start(ap, fmt);
+  char *tmp        = vStringPrintf(NULL, fmt, ap);
+  va_end(ap);
+  int tmpLength    = strlen(tmp);
+
+  if (*headerLength >= 2 && !memcmp(*header + *headerLength - 2, "\r\n", 2)) {
+    *headerLength -= 2;
+  }
+  check(*header    = realloc(*header, *headerLength + tmpLength + 2));
+
+  memcpy(*header + *headerLength, tmp, tmpLength);
+  memcpy(*header + *headerLength + tmpLength, "\r\n", 2);
+  *headerLength   += tmpLength + 2;
+  free(tmp);
+}
+
 void httpTransfer(struct HttpConnection *http, char *msg, int len) {
   check(msg);
   check(len >= 0);
-  
+
+  // Internet Explorer seems to have difficulties with compressed data. It
+  // also has difficulties with SSL connections that are being proxied.
+  int ieBug                 = 0;
+  const char *userAgent     = getFromHashMap(&http->header, "user-agent");
+  const char *msie          = userAgent ? strstr(userAgent, "MSIE ") : NULL;
+  if (msie) {
+    ieBug++;
+  }
+
+  char *header              = NULL;
+  int headerLength          = 0;
+  int bodyOffset            = 0;
+
+  int compress              = 0;
   if (!http->totalWritten) {
     // Perform some basic sanity checks. This does not necessarily catch all
     // possible problems, though.
-    int l                  = len;
-    for (char *eol, *lastLine = NULL, *line = msg;
+    int l                   = len;
+    char *line              = msg;
+    for (char *eol, *lastLine = NULL;
          l > 0 && (eol = memchr(line, '\n', l)) != NULL; ) {
       // All lines end in CR LF
       check(eol[-1] == '\r');
@@ -432,9 +575,9 @@ void httpTransfer(struct HttpConnection *http, char *msg, int len) {
         check(!memcmp(line, "HTTP/1.", 7));
         check(line[7] >= '0' && line[7] <= '9' &&
               (line[8] == ' ' || line[8] == '\t'));
-        int i              = eol - line - 9;
+        int i               = eol - line - 9;
         for (char *ptr = line + 9; i-- > 0; ) {
-          char ch          = *ptr++;
+          char ch           = *ptr++;
           if (ch < '0' || ch > '9') {
             check(ptr > line + 10);
             check(ch == ' ' || ch == '\t');
@@ -443,8 +586,19 @@ void httpTransfer(struct HttpConnection *http, char *msg, int len) {
         }
         check(i > 1);
       } else if (line + 1 == eol) {
-        // Don't send any data with HEAD requests
-        check(l == 2 || strcmp(http->method, "HEAD"));
+        // Found the end of the headers.
+
+        // Check that we don't send any data with HEAD requests
+        int isHead          = !strcmp(http->method, "HEAD");
+        check(l == 2 || !isHead);
+
+        #ifdef HAVE_ZLIB
+        // Compress replies that might exceed the size of a single IP packet
+        compress            = !ieBug && !isHead &&
+                              !http->isPartialReply &&
+                              len > 1400 &&
+                              httpAcceptsEncoding(http, "deflate");
+        #endif
         break;
       } else {
         // Header lines either contain a colon, or they are continuation
@@ -453,42 +607,107 @@ void httpTransfer(struct HttpConnection *http, char *msg, int len) {
           check(memchr(line, ':', eol - line));
         }
       }
-      lastLine             = line;
-      l                   -= eol - line + 1;
-      line                 = eol + 1;
+      lastLine              = line;
+      l                    -= eol - line + 1;
+      line                  = eol + 1;
+    }
+
+    if (ieBug || compress) {
+      if (l >= 2 && !memcmp(line, "\r\n", 2)) {
+        line               += 2;
+        l                  -= 2;
+      }
+      headerLength          = line - msg;
+      bodyOffset            = headerLength;
+      check(header          = malloc(headerLength));
+      memcpy(header, msg, headerLength);
+    }
+    if (ieBug) {
+      removeHeader(header, &headerLength, "connection:");
+      addHeader(&header, &headerLength, "Connection: close\r\n");
+    }
+
+    if (compress) {
+      #ifdef HAVE_ZLIB
+      // Compress the message
+      char *compressed;
+      check(compressed      = malloc(len));
+      check(len >= bodyOffset + 2);
+      z_stream strm         = { .zalloc    = Z_NULL,
+                                .zfree     = Z_NULL,
+                                .opaque    = Z_NULL,
+                                .avail_in  = l,
+                                .next_in   = (unsigned char *)line,
+                                .avail_out = len,
+                                .next_out  = (unsigned char *)compressed
+                              };
+      if (deflateInit(&strm, Z_DEFAULT_COMPRESSION) == Z_OK) {
+        if (deflate(&strm, Z_FINISH) == Z_STREAM_END) {
+          // Compression was successful and resulted in reduction in size
+          debug("Compressed response from %d to %d", len, len-strm.avail_out);
+          free(msg);
+          msg               = compressed;
+          len              -= strm.avail_out;
+          bodyOffset        = 0;
+          removeHeader(header, &headerLength, "content-length:");
+          removeHeader(header, &headerLength, "content-encoding:");
+          addHeader(&header, &headerLength, "Content-Length: %d\r\n", len);
+          addHeader(&header, &headerLength, "Content-Encoding: deflate\r\n");
+        } else {
+          free(compressed);
+        }
+        deflateEnd(&strm);
+      } else {
+        free(compressed);
+      }
+      #endif
     }
   }
-  http->totalWritten      += len;
-  if (!len) {
-    free(msg);
+
+  http->totalWritten       += headerLength + (len - bodyOffset);
+  if (!headerLength) {
+    free(header);
   } else if (http->msg) {
-    check(http->msg        = realloc(http->msg,
-                                     http->msgLength - http->msgOffset + len));
+    check(http->msg         = realloc(http->msg,
+                                      http->msgLength - http->msgOffset +
+                                      max(http->msgOffset, headerLength)));
     if (http->msgOffset) {
       memmove(http->msg, http->msg + http->msgOffset,
               http->msgLength - http->msgOffset);
-      http->msgLength     -= http->msgOffset;
-      http->msgOffset      = 0;
+      http->msgLength      -= http->msgOffset;
+      http->msgOffset       = 0;
     }
-    memcpy(http->msg + http->msgLength, msg, len);
-    http->msgLength       += len;
+    memcpy(http->msg + http->msgLength, header, headerLength);
+    http->msgLength        += headerLength;
+    free(header);
+  } else {
+    check(!http->msgOffset);
+    http->msg               = header;
+    http->msgLength         = headerLength;
+  }
+
+  if (len <= bodyOffset) {
+    free(msg);
+  } else if (http->msg) {
+    check(http->msg         = realloc(http->msg,
+                                      http->msgLength - http->msgOffset +
+                                      max(http->msgOffset, len - bodyOffset)));
+    if (http->msgOffset) {
+      memmove(http->msg, http->msg + http->msgOffset,
+              http->msgLength - http->msgOffset);
+      http->msgLength      -= http->msgOffset;
+      http->msgOffset       = 0;
+    }
+    memcpy(http->msg + http->msgLength, msg + bodyOffset, len - bodyOffset);
+    http->msgLength        += len - bodyOffset;
     free(msg);
   } else {
     check(!http->msgOffset);
-    http->msg              = msg;
-    http->msgLength        = len;
-  }
-
-  // Internet Explorer prior to version 7 has a bug when send XMLHttpRequests
-  // over HTTPS that go through a proxy. It won't see the reply until we
-  // close the connection.
-  int ieBug                = 0;
-  if (http->sslHndl) {
-    const char *userAgent  = getFromHashMap(&http->header, "user-agent");
-    const char *msie       = userAgent ? strstr(userAgent, "MSIE ") : NULL;
-    if (msie && msie[5] >= '4' && msie[5] <= '6') {
-      ieBug++;
+    if (bodyOffset) {
+      memmove(msg, msg + bodyOffset, len - bodyOffset);
     }
+    http->msg               = msg;
+    http->msgLength         = len - bodyOffset;
   }
 
   // The caller can suspend the connection, so that it can send an
@@ -499,20 +718,20 @@ void httpTransfer(struct HttpConnection *http, char *msg, int len) {
   // return additional data in subsequent calls to the callback handler.
   if (http->isSuspended || http->isPartialReply) {
     if (http->msg && http->msgLength > 0) {
-      int wrote            = httpWrite(http, http->msg, http->msgLength);
+      int wrote             = httpWrite(http, http->msg, http->msgLength);
       if (wrote < 0 && errno != EAGAIN) {
         httpCloseRead(http);
         free(http->msg);
-        http->msgLength    = 0;
-        http->msg          = NULL;
+        http->msgLength     = 0;
+        http->msg           = NULL;
       } else if (wrote > 0) {
         if (wrote == http->msgLength) {
           free(http->msg);
-          http->msgLength  = 0;
-          http->msg        = NULL;
+          http->msgLength   = 0;
+          http->msg         = NULL;
         } else {
           memmove(http->msg, http->msg + wrote, http->msgLength - wrote);
-          http->msgLength -= wrote;
+          http->msgLength  -= wrote;
         }
       }
     }

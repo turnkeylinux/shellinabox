@@ -15,19 +15,32 @@ dist_doc_DATA        = AUTHORS                                                \
                        INSTALL                                                \
                        NEWS                                                   \
                        README                                                 \
-                       TODO
+                       TODO                                                   \
+                       shellinabox/white-on-black.css                         \
+                       shellinabox/black-on-white.css                         \
+                       shellinabox/monochrome.css                             \
+                       shellinabox/color.css
 EXTRA_DIST           = demo/beep.wav                                          \
                        demo/favicon.ico                                       \
                        demo/demo.html                                         \
                        demo/demo.js                                           \
                        demo/demo.jspp                                         \
                        demo/demo.xml                                          \
+                       demo/enabled.gif                                       \
                        demo/styles.css                                        \
+                       demo/print-styles.css                                  \
                        demo/vt100.js                                          \
+                       demo/usercss-0.css                                     \
+                       demo/usercss-1.css                                     \
+                       demo/usercss-2.css                                     \
+                       demo/usercss-3.css                                     \
                        shellinabox/shellinaboxd.man.in                        \
                        shellinabox/shell_in_a_box.js                          \
                        shellinabox/vt100.js                                   \
+                       shellinabox/cgi-mode-example.sh                        \
                        debian/README                                          \
+                       debian/README.available                                \
+                       debian/README.enabled                                  \
                        debian/changelog                                       \
                        debian/compat                                          \
                        debian/control                                         \
@@ -75,11 +88,15 @@ shellinaboxd_SOURCES = shellinabox/shellinaboxd.c                             \
                        shellinabox/service.h                                  \
                        shellinabox/session.c                                  \
                        shellinabox/session.h                                  \
+                       shellinabox/usercss.c                                  \
+                       shellinabox/usercss.h                                  \
                        shellinabox/cgi_root.html                              \
                        shellinabox/root_page.html                             \
                        shellinabox/vt100.jspp                                 \
                        shellinabox/shell_in_a_box.jspp                        \
                        shellinabox/styles.css                                 \
+                       shellinabox/print-styles.css                           \
+                       shellinabox/enabled.gif                                \
                        shellinabox/favicon.ico                                \
                        shellinabox/beep.wav                                   \
                        config.h
@@ -102,10 +119,10 @@ renamesymbols        =                                                        \
       -e ':0'                                                                 \
       -e 's/$$/aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpPqQrRsStTuUvVwWxXyYzZ/'         \
       -e ':1'                                                                 \
-      -e 's/\(=[^_]*\)_\([a-z]\)\([^ ]* .*\2\)\(.\)/\1\4\3\4/'                \
+      -e 's/\(=[^-_]*\)[-_]\([a-z]\)\([^ ]* .*\2\)\(.\)/\1\4\3\4/'            \
       -e 't1'                                                                 \
       -e 's/.\{53\}$$//'                                                      \
-      -e 's/[/.]/_/g'                                                         \
+      -e 's/[-/.]/_/g'                                                        \
       -e 's/^/--redefine-sym _binary_/'                                       \
       -e 's/\([^=]*\)\(=[^ ]*\)/& \1_end\2End/'                               \
       -e 's/\([^=]*\)\(=[^ ]*\)/& \1_start\2Start/'                           \
@@ -119,9 +136,18 @@ ${top_srcdir}/demo/demo.js: ${top_srcdir}/demo/beep.wav                       \
                             ${top_srcdir}/demo/demo.jspp                      \
                             ${top_srcdir}/demo/favicon.ico                    \
                             ${top_srcdir}/demo/styles.css                     \
-                            ${top_srcdir}/demo/vt100.js
+                            ${top_srcdir}/demo/print-styles.css               \
+                            ${top_srcdir}/demo/vt100.js                       \
+                            ${top_srcdir}/demo/usercss-0.css                  \
+                            ${top_srcdir}/demo/usercss-1.css                  \
+                            ${top_srcdir}/demo/usercss-2.css                  \
+                            ${top_srcdir}/demo/usercss-3.css
 
 ${top_srcdir}/demo/beep.wav: ${top_srcdir}/shellinabox/beep.wav
+	@rm -f "$@"
+	ln "$<" "$@"
+
+${top_srcdir}/demo/enabled.gif: ${top_srcdir}/shellinabox/enabled.gif
 	@rm -f "$@"
 	ln "$<" "$@"
 
@@ -130,6 +156,26 @@ ${top_srcdir}/demo/favicon.ico: ${top_srcdir}/shellinabox/favicon.ico
 	ln "$<" "$@"
 
 ${top_srcdir}/demo/styles.css: ${top_srcdir}/shellinabox/styles.css
+	@rm -f "$@"
+	sed -e '/\[if DEFINES_COLORS\]/,/\[endif DEFINES_COLORS\]/d' "$<" >"$@"
+
+${top_srcdir}/demo/print-styles.css: ${top_srcdir}/shellinabox/print-styles.css
+	@rm -f "$@"
+	ln "$<" "$@"
+
+${top_srcdir}/demo/usercss-0.css: ${top_srcdir}/shellinabox/white-on-black.css
+	@rm -f "$@"
+	ln "$<" "$@"
+
+${top_srcdir}/demo/usercss-1.css: ${top_srcdir}/shellinabox/black-on-white.css
+	@rm -f "$@"
+	ln "$<" "$@"
+
+${top_srcdir}/demo/usercss-2.css: ${top_srcdir}/shellinabox/monochrome.css
+	@rm -f "$@"
+	ln "$<" "$@"
+
+${top_srcdir}/demo/usercss-3.css: ${top_srcdir}/shellinabox/color.css
 	@rm -f "$@"
 	ln "$<" "$@"
 
@@ -143,18 +189,22 @@ shellinaboxd.1: shellinabox/shellinaboxd.man.in config.h
 	if [ `sed -e 's/^#define \([^ ]*\).*/\1/' -e t -e d config.h |        \
              egrep 'HAVE_OPENSSL_BIO_H|HAVE_OPENSSL_ERR_H|HAVE_OPENSSL_SSL_H'|\
              wc -l` -eq 3 ]; then                                             \
-	  sed -e '/^#ifdef  *HAVE_OPENSSL$$/d'                                \
-	      -e '/^#endif$$/d' "$$src" >"$@";                                \
+	  sed -e '/^#ifndef  *HAVE_OPENSSL$$/,/^#endif$$/d' "$$src";          \
 	else                                                                  \
-	  sed -e '/^#ifdef  *HAVE_OPENSSL$$/,/^#endif$$/d' "$$src" >"$@";     \
-	fi;                                                                   \
+	  sed -e '/^#ifdef  *HAVE_OPENSSL$$/,/^#endif$$/d' "$$src";           \
+	fi |                                                                  \
 	if sed -e 's/^#define \([^ ]*\).*/\1/' -e t -e d config.h |           \
              grep 'HAVE_SECURITY_PAM_APPL_H' >/dev/null 2>&1; then            \
-	  sed -e '/^#ifdef  *HAVE_PAM$$/d'                                    \
-	      -e '/^#endif$$/d' "$$src" >"$@";                                \
+	  sed -e '/^#ifndef  *HAVE_PAM$$/,/^#endif$$/d';                      \
 	else                                                                  \
-	  sed -e '/^#ifdef  *HAVE_PAM$$/,/^#endif$$/d' "$$src" >"$@";         \
-	fi
+	  sed -e '/^#ifdef  *HAVE_PAM$$/,/^#endif$$/d';                       \
+	fi |                                                                  \
+	if [ -n "${DPKGBUILD}" ]; then                                        \
+	  sed -e '/^#ifndef  *DPKGBUILD$$/,/^#endif$$/d';                     \
+	else                                                                  \
+	  sed -e '/^#ifdef  *DPKGBUILD$$/,/^#endif$$/d';                      \
+	fi |                                                                  \
+	sed -e '/^#/d' >"$@"
 	@out=`echo "$@" 2>/dev/null|sed -e 's/\.[^.]*$$/.ps/'`;               \
 	man -Tps "./$@" >"$${out}" 2>/dev/null || rm -f "$${out}"
 
@@ -167,6 +217,11 @@ clean-local:
                 debian/tmp
 
 .css.o:
+	@echo objcopy "$<" "$@"
+	@objcopy -I binary `$(objcopyflags)` `echo "$<" | $(renamesymbols)`   \
+	  "$<" "$@"
+
+.gif.o:
 	@echo objcopy "$<" "$@"
 	@objcopy -I binary `$(objcopyflags)` `echo "$<" | $(renamesymbols)`   \
 	  "$<" "$@"

@@ -44,15 +44,18 @@
 .\" The most up-to-date version of this program is always available from
 .\" http://shellinabox.com
 .\"
-.TH SHELLINABOXD 1 "Dec 25, 2008"
+.TH SHELLINABOXD 1 "Nov 21, 2009"
 .SH NAME
 shellinaboxd \- publish command line shell through AJAX interface
 .SH SYNOPSIS
 .TP
 .B shellinaboxd
 [\ \fB-b\fP\ | \fB--background\fP[\fB=\fP\fIpidfile\fP]\ ]
+#ifdef HAVE_OPENSSL
 [\ \fB-c\fP\ | \fB--cert=\fP\fIcertdir\fP\ ]
+#endif
 [\ \fB--cert-fd=\fP\fIfd\fP\ ]
+[\ \fB--css=\fP\fIfilename\fP\ ]
 [\ \fB--cgi\fP[\fB=\fP\fIportrange\fP]\ ]
 [\ \fB-d\fP\ | \fB--debug\fP\ ]
 [\ \fB-f\fP\ | \fB--static-file=\fP\fIurl\fP:\fIfile\fP\ ]
@@ -64,10 +67,13 @@ shellinaboxd \- publish command line shell through AJAX interface
 [\ \fB-n\fP\ | \fB--numeric\fP\ ]
 [\ \fB-p\fP\ | \fB--port=\fP\fIport\fP\ ]
 [\ \fB-s\fP\ | \fB--service=\fP\fIservice\fP\ ]
+#ifdef HAVE_OPENSSL
 [\ \fB-t\fP\ | \fB--disable-ssl\fP\ ]
+#endif
 [\ \fB--disable-ssl-menu\fP\ ]
 [\ \fB-q\fP\ | \fB--quiet\fP\ ]
 [\ \fB-u\fP\ | \fB--user=\fP\fIuid\fP\ ]
+[\ \fB--user-css=\fP\fIstyles\fP\ ]
 [\ \fB-v\fP\ | \fB--verbose\fP\ ]
 [\ \fB--version\fP\ ]
 .SH DESCRIPTION
@@ -100,6 +106,7 @@ Launch
 .B shellinaboxd
 as a background daemon process. Optionally, write the process id to
 .IR pidfile .
+#ifdef HAVE_OPENSSL
 .TP
 \fB-c\fP\ |\ \fB--cert=\fP\fIcertdir\fP
 If built with SSL/TLS support enabled, the daemon will look in
@@ -151,6 +158,20 @@ where the certificate and key can be retrieved. While this option disables
 .B SNI
 support, it does offer an alternative solution for securely providing
 the private key data to the daemon.
+#endif
+.TP
+\fB--css=\fP\fIfilename\fP
+Sometimes, it is not necessary to replace the entire style sheet using the
+.B --static-file
+option. But instead a small incremental change should be made to the visual
+appearance of the terminal. The
+.B --css
+option provides a means to append additional style rules to the end of
+the default
+.B styles.css
+sheet. More than one
+.B --css
+option can be given on the same command line.
 .TP
 \fB--cgi\fP[\fB=\fP\fIportrange\fP]
 Instead of running
@@ -216,6 +237,10 @@ JavaScript file implementing the AJAX terminal emulator.
 .TP
 .B styles.css
 CSS style file that controls the visual appearance of the terminal.
+.TP
+.B print-styles.css
+CSS style file that controls the visual appearance of printed pages when using
+the VT100 transparent printing feature.
 .P
 It is not recommended to override the root HTML page for a particular
 .IR service .
@@ -302,13 +327,16 @@ virtual hosting.
 \fB-s\fP\ |\ \fB--service=\fP\fIservice\fP
 One or more services can be registered on different URL paths:
 .in +4
-\fISERVICE\fP := <url-path> ':' \fIAPPLICATON\fP
+\fISERVICE\fP := <url-path> ':' \fIAPPLICATION\fP
 .in
-There is one pre-defined \fIapplication\fP, 'LOGIN'. It causes the
+
+There is a pre-defined \fIapplication\fP, 'LOGIN', which causes the
 daemon to invoke
 .B /bin/login
-to request the user's name and password, and to start his
-login shell. This is the default option, if no
+requesting the user's name and password, and starting his
+login shell. This is the default option for the
+.B root
+user, if no
 .B --service
 was defined. Starting
 .B /bin/login
@@ -316,10 +344,22 @@ requires
 .B root
 privileges.
 
+There is another pre-defined \fIapplication\fP, 'SSH'. Instead of invoking
+.BR /bin/login ,
+it calls
+.BR ssh .
+This is the default option for unprivileged users, if no
+.B --service
+was defined. This operation is available to both privileged and regular
+users. If the optional \fIhost\fP parameter is omitted,
+.B shellinaboxd
+connects to
+.BR localhost .
+
 Alternatively, an \fIapplication\fP can be specified by providing a
 \fIuser\fP description, a working directory, and a command line:
 .in +4
-\fIAPPLICATION\fP := 'LOGIN' | \fIUSER\fP ':' \fICWD\fP ':' <cmdline>
+\fIAPPLICATION\fP := 'LOGIN' | 'SSH' [ ':' <host> ] |  \fIUSER\fP ':' \fICWD\fP ':' <cmdline>
 
 #ifdef HAVE_PAM
 .in
@@ -328,9 +368,11 @@ be requested interactively, instead of being provided as part of the
 \fIservice\fP description:
 .in +4
 #endif
-\fIUSER\fP :=
 #ifdef HAVE_PAM
-'AUTH' |
+\fIUSER\fP := 'AUTH' |
+#endif
+#ifndef HAVE_PAM
+\fIUSER\fP :=
 #endif
 <username> ':' <groupname>
 .in
@@ -366,6 +408,9 @@ name of remote peer.
 .B ${uid}
 numeric user id.
 .TP
+.B ${url}
+the URL that serves the terminal session.
+.TP
 .B ${user}
 user name.
 .P
@@ -391,11 +436,19 @@ If no explicit
 .B --service
 has been requested,
 .B shellinaboxd
-defaults to attaching
-.B /bin/login
-to the root directory of the web server. This is equivalent to saying
-.BR --service=/:LOGIN .
+defaults to attaching the default service to the root directory of the web
+server. For
+.BR root ,
+this is
+.BR /bin/login ,
+and for unprivileged users, this is \fBssh localhost\fP. This is equivalent
+to saying
+.BR --service=/:LOGIN ,
+or
+.BR --service=/:SSH ,
+respectively.
 .RE
+#ifdef HAVE_OPENSSL
 .TP
 \fB-t\fP\ |\ \fB--disable-ssl\fP
 By default,
@@ -406,6 +459,7 @@ undesired, this behavior can be disabled.
 
 This option is also useful during testing or for deployment in trusted
 intranets, if SSL certificates are unavailable.
+#endif
 .TP
 \fB--disable-ssl-menu\fP
 If the user should not be able to switch between HTTP and HTTPS modes, this
@@ -433,6 +487,44 @@ For more details, refer to the description of the
 .B --group
 option.
 .TP
+\fB--user-css=\fP\fIstyles\fP
+The visual appearance of the terminal emulator can be customized
+through user-selectable style sheets. These style sheets will show up
+as options in the right-click context menu of the terminal emulator.
+
+Styles sheet make up either independently selectable on/off options,
+or multiple style sheets can be grouped together. When forming a group,
+only one member of the group can be active at any given time. This is
+used for multiple-choice options.
+
+Multiple independent groups are separated by semicolons:
+.in +4
+\fISTYLES\fP := \fIGROUP\fP { ';' \fIGROUP\fP }*
+.in
+
+The members of a group are separated by commas:
+.in +4
+\fIGROUP\fP := \fIOPTION\fP { ',' OPTION }*
+.in
+
+Groups with exactly one member are used for options that can be
+independently turned on and off.
+
+Options include a human readable label that will be shown in the
+context menu, followed by the name of the CSS file. They also must
+include an indicator showing whether the option should initially be
+turned on or turned off. Within a group, exactly one option should be
+turned on:
+.in +4
+\fIOPTION\fP := <label> ':' [ '-' | '+' ] <css-file>
+.in
+
+The user's selection of options will be persisted in a cookie. This
+means, the default settings of options as passed on the command line
+only takes effect the very first time the user visits the terminal
+emulator in his browser. On all subsequent visits, the user's
+preferences take precedence.
+.TP
 \fB-v\fP\ |\ \fB--verbose\fP
 Enables logging of
 .IR Apache -style
@@ -446,36 +538,93 @@ and
 \fB--version\fP
 Prints the version number of the binary and exits.
 .SH CONFIGURATION
+#ifndef DPKGBUILD
 There are no configuration files or permanent settings for
 .BR shell\%ina\%boxd .
+#endif
+#ifdef DPKGBUILD
+Except for the options in
+.I /etc/default/shellinabox
+that are used when running the daemon as a system-wide service, and
+except for the style sheet definitions in
+.IR /etc/shellinabox ,
+there are no other configuration options.
+#endif
+
 A small number of run-time configuration options are available from a
-context menu that becomes available when clicking the right mouse button.
+context menu that becomes available when clicking the right mouse
+button. These options get persisted in a browser cookie.
+
+Many sites already have a web server running and would like to
+integrate
+.B shellinaboxd
+into their existing site. This is most commonly done by means of a
+reverse-proxy entry for the main web server. For
+.I Apache
+this would require adding an option such as:
+.in +4
+ <Location /shell>
+     ProxyPass  http://localhost:4200/
+     Order      allow,deny
+     Allow      from all
+ </Location>
+.in
+
+If you are using a different web server, refer to that server's
+documentation on how to configure reverse proxy operations.
+
+When using a reverse proxy, the
+.B --localhost-only
+option would normally be enabled as well.
+#ifdef DPKGBUILD
+This can be done in
+.IR /etc/default/shellinabox .
+#endif
+In addition, the
+.B --disable-ssl
+might also be considered depending on the exact configuration details
+of the reverse proxy.
 .SH EXAMPLES
 .TP \w'shellinaboxd\ 'u
+.B shellinaboxd
+Attaches a web-enabled login shell to
+.IR https://localhost:4200/ .
+If the user connected without SSL, the session will automatically be promoted.
+Unless SSL certificates can be found in the current directory, the daemon will
+automatically generate suitable self-signed certificates. If the command was
+invoked by a non-\fBroot\fP user, the daemon uses
+.B ssh
+instead of
+.B /bin/login
+for the session.
+.TP
 .B shellinaboxd -t
 Attaches a web-enabled login shell to
 .I http://localhost:4200/
-with SSL/TLS support disabled. This command must be run as
-.B root
-or the attempt to launch
-.I /bin/login
-will fail.
+with SSL/TLS support disabled.
 .TP
 .B shellinaboxd -t -f beep.wav:/dev/null
 Runs all services with the audible-bell permanently disabled.
+.TP
+.B shellinaboxd -s /:SSH:example.org
+The terminal connects to a
+.B ssh
+session on
+.IR example.org .
 .TP
 .B shellinaboxd -t -s /:AUTH:HOME:/bin/bash
 Interactively request the user's name and password prior to launching
 a Bourne shell. This command can be run by unprivileged users. But if
 doing so, it only allows this particular user to log in.
 .TP
-.B shellinaboxd -c certificates -g shellinaboxd
+.B shellinaboxd -c certificates -u shellinabox -g shellinabox
 If the
 .B certificates
 directory exists and is writable by the
-.B shellinaboxd
-group, self-signed SSL certificates will be generated in this
-directory. Running this command as
+.B shellinabox
+user and group, self-signed SSL certificates will be generated in this
+directory. This might require creating an appropriately named user first.
+Running this command as
 .B root
 allows any user on the system to log in at
 .BR http://localhost:4200/ .
@@ -499,6 +648,46 @@ terminal, publish a
 .B Wyse 60\*(Tm
 terminal. Again, this command should be run as
 .BR root .
+.TP
+#ifndef DPKGBUILD
+.B shellinaboxd --css white-on-black.css
+#endif
+#ifdef DPKGBUILD
+.B shellinaboxd --css '/etc/shellinabox/options-available/00_White On Black.css'
+#endif
+Loads the
+#ifndef DPKGBUILD
+.B white-on-black.css
+#endif
+#ifdef DPKGBUILD
+.B 00_White On Black.css
+#endif
+style sheet
+#ifndef DPKGBUILD
+from the current directory
+#endif
+and appends it to the built-in
+.B styles.css
+sheet. This causes the terminal to always render white text on a black
+background.
+.TP
+.B shellinaboxd --user-css Normal:+black-on-white.css,Reverse:-white-on-black.css
+Allow the user to select whether they want text to be rendered
+normally or in reverse video. This command line option adds a new
+entry to the right-click context menu.
+#ifdef DPKGBUILD
+
+If starting
+.B shellinaboxd
+as a system process, the
+.I /etc/init.d/shellinabox
+script looks in
+.I /etc/shell\%in\%a\%box/op\%tions-\%en\%abled
+for style sheets that should be added to the command line. See the
+.I README
+file in that directory for details on how to configure system-wide
+options.
+#endif
 .P
 .SH DIAGNOSTICS
 The daemon returns a non-zero exit code in case of failure. With the
@@ -512,6 +701,38 @@ Common failure conditions are reusing a port that is already in use,
 lack of sufficient privileges to run a service, failure to find
 SSL/TLS certificates, and failure to write newly generated
 certificates to the certification directory.
+#ifdef DPKGBUILD
+.SH FILES
+.TP 10
+.I /etc/default/shellinabox
+The system-wide installation of
+.B shellinaboxd
+can be configured by editing this file. After making any changes, restart
+the daemon with \fBsudo service shellinabox restart\fP.
+.TP
+.I /etc/shellinabox
+This directory contains style sheets that will be used for the
+.B --user-css 
+command line option, when running
+.B shellinaboxd
+as a system-wide service.
+.TP
+.I /etc/init.d/shellinabox
+This is the system-wide service definition. Usually, there is no need to
+edit this file.
+.TP
+.I /var/lib/shellinabox
+This directory contains the certificate files that
+.B shellinaboxd
+uses when serving encrypted SSL sessions. If suitable files do not exist, yet,
+it tries to populate the directory with self-signed certificates the first
+time a particular certificate is needed. Over time, it should contain
+\fBcertificate.pem\fP, \fBcertificate-localhost.pem\fP, and
+\fBcertificate-\fP\fIHOSTNAME\fP\fB.pem\fP.
+.TP
+.I /var/run/shellinaboxd.pid
+This file is created any time the system-wide service gets started.
+#endif
 .SH "SEE ALSO"
 .BR chmod (1),
 .BR last (1),

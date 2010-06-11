@@ -50,10 +50,10 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include "shellinabox/service.h"
+#include "logging/logging.h"
 #include "shellinabox/launcher.h"
 #include "shellinabox/privileges.h"
-#include "logging/logging.h"
+#include "shellinabox/service.h"
 
 
 struct Service **services;
@@ -100,6 +100,55 @@ void initService(struct Service *service, const char *arg) {
     check(service->cwd                      = strdup("/"));
     check(service->cmdline                  = strdup(
                                                   "/bin/login -p -h ${peer}"));
+  } else if (!strcmp(arg, "SSH") || !strncmp(arg, "SSH:", 4)) {
+    service->useLogin                       = 0;
+    service->useHomeDir                     = 0;
+    service->authUser                       = 2;
+    service->uid                            = -1;
+    service->gid                            = -1;
+    service->user                           = NULL;
+    service->group                          = NULL;
+    check(service->cwd                      = strdup("/"));
+    char *host;
+    check(host                              = strdup("localhost"));
+    if ((ptr                                = strchr(arg, ':')) != NULL) {
+      check(ptr                             = strdup(ptr + 1));
+      char *end;
+      if ((end                              = strchr(ptr, ':')) != NULL) {
+        *end                                = '\000';
+      }
+      if (*ptr) {
+        free(host);
+        host                                = ptr;
+      } else {
+        free(ptr);
+      }
+    }
+
+    // Don't allow manipulation of the SSH command line through "creative" use
+    // of the host name.
+    for (char *h = host; *h; h++) {
+      char ch                               = *h;
+      if (!((ch >= '0' && ch <= '9') ||
+            (ch >= 'A' && ch <= 'Z') ||
+            (ch >= 'a' && ch <= 'z') ||
+            ch == '-' || ch == '.')) {
+        fatal("Invalid hostname \"%s\" in service definition", host);
+      }
+    }
+
+    service->cmdline                        = stringPrintf(NULL,
+      "ssh -a -e none -i /dev/null -x -oChallengeResponseAuthentication=no "
+          "-oCheckHostIP=no -oClearAllForwardings=yes -oCompression=no "
+          "-oControlMaster=no -oGSSAPIAuthentication=no "
+          "-oHostbasedAuthentication=no -oIdentitiesOnly=yes "
+          "-oKbdInteractiveAuthentication=yes -oPasswordAuthentication=yes "
+          "-oPreferredAuthentications=keyboard-interactive,password "
+          "-oPubkeyAuthentication=no -oRhostsRSAAuthentication=no "
+          "-oRSAAuthentication=no -oStrictHostKeyChecking=no -oTunnel=no "
+          "-oUserKnownHostsFile=/dev/null -oVerifyHostKeyDNS=no "
+          "-oVisualHostKey=no -oLogLevel=QUIET %%s@%s", host);
+    free(host);
   } else {
     service->useLogin                       = 0;
 

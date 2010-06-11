@@ -48,22 +48,52 @@
     http://shellinabox.com
     -->
     <title>Shell In A Box</title>
+    <script type="text/javascript"><!--
+      // Check that our URL is well-formed. Redirect to HTTPS if necessary
+      (function() {
+        var hasSSL = %s;
+        var path   = document.location.pathname;
+        var proto  = (hasSSL || (document.location.protocol == 'https:'))
+                     ? 'https:' : 'http:';
+        if (path.match(/plain/)) {
+          proto   = 'http:';
+        }
+        path      = path.replace(/\/+/, '/').replace(/\/$/, '');
+        if (!path.match(/(?:\/|\/plain)$/)) {
+          path   += '/';
+        }
+        var url   = proto + '//' + document.location.host + path;
+        if (document.location.search != '' &&
+            document.location.search != '?') {
+          url    += document.location.search;
+        }
+        if (document.location.hash != '' &&
+            document.location.hash != '#') {
+          url    += document.location.hash;
+        }
+        if (url != document.location.href) {
+          document.location.replace(url);
+        }
+      })();
+    --></script>
     <link rel="stylesheet" href="styles.css" type="text/css">
     <script type="text/javascript"><!--
-      // We would like to hide overflowing lines as this can lead to
-      // visually jarring results if the browser substitutes oversized
-      // Unicode characters from different fonts. Unfortunately, a bug
-      // in Firefox prevents it from allowing multi-line text
-      // selections whenever we change the "overflow" style. So, only
-      // do so for non-Netscape browsers.
-      if (typeof navigator.appName == 'undefined' ||
-          navigator.appName != 'Netscape') {
-        document.write('<style type="text/css">' +
-                       '#vt100 #console div, #vt100 #alt_console div {' +
-                       '  overflow: hidden;' +
-                       '}' +
-                       '</style>');
-      }
+      (function() {
+        // We would like to hide overflowing lines as this can lead to
+        // visually jarring results if the browser substitutes oversized
+        // Unicode characters from different fonts. Unfortunately, a bug
+        // in Firefox prevents it from allowing multi-line text
+        // selections whenever we change the "overflow" style. So, only
+        // do so for non-Netscape browsers.
+        if (typeof navigator.appName == 'undefined' ||
+            navigator.appName != 'Netscape') {
+          document.write('<style type="text/css">' +
+                         '#vt100 #console div, #vt100 #alt_console div {' +
+                         '  overflow: hidden;' +
+                         '}' +
+                         '</style>');
+        }
+      })();
     --></script>
     <link rel="shortcut icon" href="favicon.ico" type="image/x-icon">
     <script type="text/javascript" src="ShellInABox.js"></script>

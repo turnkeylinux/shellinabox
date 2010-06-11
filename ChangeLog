@@ -1,3 +1,84 @@
+2009-11-21  Markus Gutschke  <markus@shellinabox.com>
+
+	* Updated manual page documenting --user-css
+
+	* Released version 2.10
+
+2009-11-18  Markus Gutschke  <markus@shellinabox.com>
+
+	* Fixed some compiler warnings when using more recent versions of
+	gcc and glibc.
+
+	* Tweak the handling of CTRL keys, so that some of the more unusual
+	combinations work. For historic reasons, there is an expectation that
+	CTRL-3..CTRL-8 return specific control characters. Also fixed the
+	handling of CTRL-\ which could cause problems with some browsers.
+
+	* Rely on the browser for capitalization. This should fix Capslock
+	behavior. Hopefully, it won't break any other keyboard features or
+	layouts.
+
+2009-08-20  Markus Gutschke  <markus@shellinabox.com>
+
+	* Added transparent printing support. The development of this
+	feature is sponsored by De Bortoli Wines Pty Limited and by
+	Eternity Technologies.
+
+2009-08-19  Markus Gutschke  <markus@shellinabox.com>
+
+	* Added a ${url} parameter that can be used in the service description.
+
+2009-08-11  Markus Gutschke  <markus@shellinabox.com>
+
+	* Added support for user selectable style sheets. Included example
+	style sheets that allow switching to white-on-black or to monochrome
+	mode from the right click context menu.
+
+	* Fixed the "|" key on Swedish keyboards.
+
+2009-07-30  Markus Gutschke  <markus@shellinabox.com>
+
+	* Added the --css command line option to make incremental changes
+	to the style sheet without having to load a full replacement with
+	the --static-file option. Added an example that enables white text
+	on a black background.
+
+	* Added Debian specific documentation to the manual page.
+
+2009-07-29  Markus Gutschke  <markus@shellinabox.com>
+
+	* Allow unprivileged users to run the daemon. This requires
+	calling "ssh" instead of "login".
+
+2009-07-27  Markus Gutschke  <markus@shellinabox.com>
+
+	* Use JavaScript redirection for attaching the missing slash to
+	the URL. This should make it easier to use reverse proxies. It was
+	already possible to run shellinaboxd behind a proxy, but a lot of
+	users got the configuration wrong.
+
+2009-07-08  Markus Gutschke  <markus@shellinabox.com>
+
+	* Optionally compress large responses, if the browser accepts
+	deflate compression. This mainly improves start up time.
+
+	* More fine tuning of the regular expressions that detect URLs.
+	We now allow '.' and ',' in URLs, as long as they are not at the
+	very end of the URL, where they would probably be part of the
+	enclosing sentence and not actually part of the URL.
+
+2009-07-06  Markus Gutschke  <markus@shellinabox.com>
+
+	* Making it easier to host the terminal on non-root URLs by always
+	redirecting to a URL that includes a trailing slash.
+
+	* Run-time testing for availability of libpthread functions does not
+	work reliably on some platforms. So, avoid doing so on anything
+	other than Linux/i386. For all other platforms, assume that the code
+	is not linked against libpthread. For ShellInABox, this is always
+	the correct assumption. But if the code gets embedded into other
+	projects, this might have to be changed.
+
 2009-07-05  Markus Gutschke  <markus@shellinabox.com>
 
 	* Released version 2.9

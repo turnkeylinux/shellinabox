@@ -159,8 +159,6 @@ static int   launcher = -1;
 static uid_t restricted;
 
 
-#if defined(HAVE_SECURITY_PAM_APPL_H) && defined(HAVE_DLOPEN)
-
 // If the PAM misc library cannot be found, we have to provide our own basic
 // conversation function. As we know that this code is only ever called from
 // ShellInABox, it can be kept significantly simpler than the more generic
@@ -210,6 +208,7 @@ static int read_string(int echo, const char *prompt, char **retstr) {
   return nc;
 }
 
+#if defined(HAVE_SECURITY_PAM_APPL_H) && defined(HAVE_DLOPEN)
 #if defined(HAVE_SECURITY_PAM_CLIENT_H)
 static pamc_bp_t *p(pamc_bp_t *p) {
   // GCC is too smart for its own good, and triggers a warning in
@@ -358,7 +357,7 @@ int supportsPAM(void) {
   // pthread_once(), instead. We perform run-time checks for whether we are
   // single- or multi-threaded, so that the same code can be used.
   // This currently only works on Linux.
-#if defined(HAVE_PTHREAD_H) && defined(__linux__)
+#if defined(HAVE_PTHREAD_H) && defined(__linux__) && defined(__i386__)
   if (!!&pthread_once) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, loadPAM);
@@ -402,21 +401,39 @@ static int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf, size_t buflen,
 }
 #endif
 
-int launchChild(int service, struct Session *session) {
+int launchChild(int service, struct Session *session, const char *url) {
   if (launcher < 0) {
     errno              = EINVAL;
     return -1;
   }
 
-  struct LaunchRequest request = {
-    .service           = service,
-    .width             = session->width,
-    .height            = session->height };
-  strncat(request.peerName, httpGetPeerName(session->http),
-          sizeof(request.peerName) - 1);
-  if (NOINTR(write(launcher, &request, sizeof(request))) != sizeof(request)) {
+  char *u;
+  check(u              = strdup(url));
+  for (int i; u[i = strcspn(u, "\\\"'`${};() \r\n\t\v\f")]; ) {
+    static const char hex[] = "0123456789ABCDEF";
+    check(u            = realloc(u, strlen(u) + 4));
+    memmove(u + i + 3, u + i + 1, strlen(u + i));
+    u[i + 2]           = hex[ u[i]       & 0xF];
+    u[i + 1]           = hex[(u[i] >> 4) & 0xF];
+    u[i]               = '%';
+  }
+
+  struct LaunchRequest *request;
+  size_t len           = sizeof(struct LaunchRequest) + strlen(u) + 1;
+  check(request        = calloc(len, 1));
+  request->service     = service;
+  request->width       = session->width;
+  request->height      = session->height;
+  strncat(request->peerName, httpGetPeerName(session->http),
+          sizeof(request->peerName) - 1);
+  request->urlLength   = strlen(u);
+  memcpy(&request->url, u, request->urlLength);
+  free(u);
+  if (NOINTR(write(launcher, request, len)) != len) {
+    free(request);
     return -1;
   }
+  free(request);
   pid_t pid;
   char cmsg_buf[CMSG_SPACE(sizeof(int))];
   struct iovec iov     = { 0 };
@@ -436,7 +453,7 @@ int launchChild(int service, struct Session *session) {
   check(cmsg);
   check(cmsg->cmsg_level == SOL_SOCKET);
   check(cmsg->cmsg_type  == SCM_RIGHTS);
-  session->pty         = *(int *)CMSG_DATA(cmsg);
+  memcpy(&session->pty, CMSG_DATA(cmsg), sizeof(int));
   return pid;
 }
 
@@ -757,106 +774,201 @@ static pam_handle_t *internalLogin(struct Service *service, struct Utmp *utmp,
   check(!sigaction(SIGALRM, &sa, NULL));
   alarm(60);
 
-  // Use PAM to negotiate user authentication and authorization
+  // Change the prompt to include the host name
+  const char *hostname         = NULL;
+  if (service->authUser == 2 /* SSH */) {
+    // If connecting to a remote host, include that hostname
+    hostname                   = strrchr(service->cmdline, '@');
+    if (!hostname || !strcmp(++hostname, "localhost")) {
+      hostname                 = NULL;
+    }
+  }
+  struct utsname uts;
+  memset(&uts, 0, sizeof(uts));
+  if (!hostname) {
+    // Find our local hostname
+    check(!uname(&uts));
+    hostname                   = uts.nodename;
+  }
+  const char *fqdn;
+  check(fqdn                   = strdup(hostname));
+  check(hostname               = strdup(hostname));
+  char *dot                    = strchr(hostname, '.');
+  if (dot) {
+    *dot                       = '\000';
+  }
+
   const struct passwd *pw;
   pam_handle_t *pam            = NULL;
-#if defined(HAVE_SECURITY_PAM_APPL_H)
-  struct pam_conv conv         = { .conv = misc_conv };
-  if (service->authUser) {
-    check(supportsPAM());
-    check(pam_start("shellinabox", NULL, &conv, &pam) == PAM_SUCCESS);
-
-    // Change the prompt to include the host name
-    struct utsname uts;
-    check(!uname(&uts));
-    const char *origPrompt;
-    check(pam_get_item(pam, PAM_USER_PROMPT, (void *)&origPrompt) ==
-          PAM_SUCCESS);
+  if (service->authUser == 2 /* SSH */) {
+    // Just ask for the user name. SSH will negotiate the password
+    char *user                 = NULL;
     char *prompt;
-    check(prompt               = stringPrintf(NULL, "%s %s", uts.nodename,
-                                         origPrompt ? origPrompt : "login: "));
-    check(pam_set_item(pam, PAM_USER_PROMPT, prompt) == PAM_SUCCESS);
-
-    // Up to three attempts to enter the user id and password
-    for (int i = 0;;) {
-      check(pam_set_item(pam, PAM_USER, NULL) == PAM_SUCCESS);
-      int rc;
-      if ((rc                  = pam_authenticate(pam, PAM_SILENT)) ==
-          PAM_SUCCESS &&
-          (geteuid() ||
-          (rc                  = pam_acct_mgmt(pam, PAM_SILENT)) ==
-           PAM_SUCCESS)) {
+    check(prompt               = stringPrintf(NULL, "%s login: ", hostname));
+    for (;;) {
+      if (read_string(1, prompt, &user) <= 0) {
+        free(user);
+        free(prompt);
+        _exit(1);
+      }
+      if (*user) {
+        for (char *u = user; *u; u++) {
+          char ch              = *u;
+          if (!((ch >= '0' && ch <= '9') ||
+                (ch >= 'A' && ch <= 'Z') ||
+                (ch >= 'a' && ch <= 'z') ||
+                ch == '-' || ch == '_' || ch == '.')) {
+            goto invalid_user_name;
+          }
+        }
         break;
       }
-      if (++i == 3) {
-        // Quit if login failed.
-        puts("\nMaximum number of tries exceeded (3)");
-        pam_end(pam, rc);
-        _exit(1);
-      } else {
-        puts("\nLogin incorrect");
-      }
+    invalid_user_name:
+      free(user);
+      user                     = NULL;
     }
-    check(pam_set_item(pam, PAM_USER_PROMPT, "login: ") == PAM_SUCCESS);
     free(prompt);
+    char *cmdline              = stringPrintf(NULL, service->cmdline, user);
+    free(user);
 
-    // Retrieve user id, and group id.
-    const char *name;
-    check(pam_get_item(pam, PAM_USER, (void *)&name) == PAM_SUCCESS);
-    pw                         = getPWEnt(getUserId(name));
-    check(service->uid < 0);
-    check(service->gid < 0);
-    check(!service->user);
-    check(!service->group);
-    service->uid               = pw->pw_uid;
-    service->gid               = pw->pw_gid;
-    check(service->user        = strdup(pw->pw_name));
-    service->group             = getGroupName(pw->pw_gid);
-  } else {
-    check(service->uid >= 0);
-    check(service->gid >= 0);
-    check(service->user);
-    check(service->group);
-    if (supportsPAM()) {
-      check(pam_start("shellinabox", service->user, &conv, &pam) ==
-            PAM_SUCCESS);
-      int rc;
+    // Replace '@localhost' with the actual host name. This results in a nicer
+    // prompt when SSH asks for the password.
+    char *ptr                  = strrchr(cmdline, '@');
+    if (!strcmp(ptr + 1, "localhost")) {
+      int offset               = ptr + 1 - cmdline;
+      check(cmdline            = realloc(cmdline,
+                                         strlen(cmdline) + strlen(fqdn) -
+                                         strlen("localhost") + 1));
+      ptr                      = cmdline + offset;
+      *ptr                     = '\000';
+      strncat(ptr, fqdn, strlen(fqdn));
+    }
 
-      // PAM account management requires root access. Just skip it, if we
-      // are running with lower privileges.
-      if (!geteuid() &&
-          (rc                  = pam_acct_mgmt(pam, PAM_SILENT)) !=
-          PAM_SUCCESS) {
-        pam_end(pam, rc);
-        _exit(1);
+    free((void *)service->cmdline);
+    service->cmdline           = cmdline;
+
+    // Run SSH as an unprivileged user
+    if ((service->uid          = restricted) == 0) {
+      if (runAsUser >= 0) {
+        service->uid           = runAsUser;
+      } else {
+        service->uid           = getUserId("nobody");
+      }
+      if (runAsGroup >= 0) {
+        service->gid           = runAsGroup;
+      } else {
+        service->gid           = getGroupId("nogroup");
       }
     }
     pw                         = getPWEnt(service->uid);
-  }
+    if (restricted) {
+      service->gid             = pw->pw_gid;
+    }
+    service->user              = getUserName(service->uid);
+    service->group             = getGroupName(service->gid);
+  } else {
+    // Use PAM to negotiate user authentication and authorization
+#if defined(HAVE_SECURITY_PAM_APPL_H)
+    struct pam_conv conv       = { .conv = misc_conv };
+    if (service->authUser) {
+      check(supportsPAM());
+      check(pam_start("shellinabox", NULL, &conv, &pam) == PAM_SUCCESS);
+
+      const char *origPrompt;
+      check(pam_get_item(pam, PAM_USER_PROMPT, (void *)&origPrompt) ==
+            PAM_SUCCESS);
+      char *prompt;
+      check(prompt             = stringPrintf(NULL, "%s %s", hostname,
+                                         origPrompt ? origPrompt : "login: "));
+      check(pam_set_item(pam, PAM_USER_PROMPT, prompt) == PAM_SUCCESS);
+
+      // Up to three attempts to enter the user id and password
+      for (int i = 0;;) {
+        check(pam_set_item(pam, PAM_USER, NULL) == PAM_SUCCESS);
+        int rc;
+        if ((rc                = pam_authenticate(pam, PAM_SILENT)) ==
+            PAM_SUCCESS &&
+            (geteuid() ||
+             (rc               = pam_acct_mgmt(pam, PAM_SILENT)) ==
+             PAM_SUCCESS)) {
+          break;
+        }
+        if (++i == 3) {
+          // Quit if login failed.
+          puts("\nMaximum number of tries exceeded (3)");
+          pam_end(pam, rc);
+          _exit(1);
+        } else {
+          puts("\nLogin incorrect");
+        }
+      }
+      check(pam_set_item(pam, PAM_USER_PROMPT, "login: ") == PAM_SUCCESS);
+      free(prompt);
+
+      // Retrieve user id, and group id.
+      const char *name;
+      check(pam_get_item(pam, PAM_USER, (void *)&name) == PAM_SUCCESS);
+      pw                       = getPWEnt(getUserId(name));
+      check(service->uid < 0);
+      check(service->gid < 0);
+      check(!service->user);
+      check(!service->group);
+      service->uid             = pw->pw_uid;
+      service->gid             = pw->pw_gid;
+      check(service->user      = strdup(pw->pw_name));
+      service->group           = getGroupName(pw->pw_gid);
+    } else {
+      check(service->uid >= 0);
+      check(service->gid >= 0);
+      check(service->user);
+      check(service->group);
+      if (supportsPAM()) {
+        check(pam_start("shellinabox", service->user, &conv, &pam) ==
+              PAM_SUCCESS);
+        int rc;
+
+        // PAM account management requires root access. Just skip it, if we
+        // are running with lower privileges.
+        if (!geteuid() &&
+            (rc                = pam_acct_mgmt(pam, PAM_SILENT)) !=
+            PAM_SUCCESS) {
+          pam_end(pam, rc);
+          _exit(1);
+        }
+      }
+      pw                       = getPWEnt(service->uid);
+    }
 #else
-  check(!supportsPAM());
-  pw                           = getPWEnt(service->uid);
+    check(!supportsPAM());
+    pw                         = getPWEnt(service->uid);
 #endif
+  }
+  free((void *)fqdn);
+  free((void *)hostname);
 
   if (restricted &&
       (service->uid != restricted || service->gid != pw->pw_gid)) {
     puts("\nAccess denied!");
 #if defined(HAVE_SECURITY_PAM_APPL_H)
-    pam_end(pam, PAM_SUCCESS);
+    if (service->authUser != 2 /* SSH */) {
+      pam_end(pam, PAM_SUCCESS);
+    }
 #endif
     _exit(1);
   }
 
+  if (service->authUser != 2 /* SSH */) {
 #if defined(HAVE_SECURITY_PAM_APPL_H)
-  if (pam) {
+    if (pam) {
 #ifdef HAVE_UTMPX_H
-    check(pam_set_item(pam, PAM_TTY, (const void **)utmp->utmpx.ut_line) ==
-          PAM_SUCCESS);
+      check(pam_set_item(pam, PAM_TTY, (const void **)utmp->utmpx.ut_line) ==
+            PAM_SUCCESS);
+#endif
+    }
+#else
+    check(!pam);
 #endif
   }
-#else
-  check(!pam);
-#endif
 
   // Retrieve supplementary group ids.
   int ngroups;
@@ -908,12 +1020,15 @@ static pam_handle_t *internalLogin(struct Service *service, struct Utmp *utmp,
 
   // Update utmp/wtmp entries
 #ifdef HAVE_UTMPX_H
-  memset(&utmp->utmpx.ut_user, 0, sizeof(utmp->utmpx.ut_user));
-  strncat(&utmp->utmpx.ut_user[0], service->user, sizeof(utmp->utmpx.ut_user));
-  setutxent();
-  pututxline(&utmp->utmpx);
-  endutxent();
-  updwtmpx("/var/log/wtmp", &utmp->utmpx);
+  if (service->authUser != 2 /* SSH */) {
+    memset(&utmp->utmpx.ut_user, 0, sizeof(utmp->utmpx.ut_user));
+    strncat(&utmp->utmpx.ut_user[0], service->user,
+            sizeof(utmp->utmpx.ut_user));
+    setutxent();
+    pututxline(&utmp->utmpx);
+    endutxent();
+    updwtmpx("/var/log/wtmp", &utmp->utmpx);
+  }
 #endif
 
   alarm(0);
@@ -926,7 +1041,8 @@ static void destroyVariableHashEntry(void *arg, char *key, char *value) {
 }
 
 static void execService(int width, int height, struct Service *service,
-                        const char *peerName, char **environment) {
+                        const char *peerName, char **environment,
+                        const char *url) {
   // Create a hash table with all the variables that we can expand. This
   // includes all environment variables being passed to the child.
   HashMap *vars;
@@ -962,6 +1078,8 @@ static void execService(int width, int height, struct Service *service,
   addToHashMap(vars, key, value);
   check(key                   = strdup("uid"));
   addToHashMap(vars, key, stringPrintf(NULL, "%d", service->uid));
+  check(key                   = strdup("url"));
+  addToHashMap(vars, key, strdup(url));
 
   enum { ENV, ARGS } state    = ENV;
   enum { NONE, SINGLE, DOUBLE
@@ -1013,11 +1131,26 @@ static void execService(int width, int height, struct Service *service,
         if (ch) {
           end++;
         }
+        int incr              = replLen - (end - ptr);
+        if (incr > 0) {
+          char *oldCmdline    = cmdline;
+          check(cmdline       = realloc(cmdline,
+                                        (end - cmdline) + strlen(end) +
+                                        incr + 1));
+          ptr                += cmdline - oldCmdline;
+          end                += cmdline - oldCmdline;
+          if (key) {
+            key              += cmdline - oldCmdline;
+          }
+          if (value) {
+            value            += cmdline - oldCmdline;
+          }
+        }
         memmove(ptr + replLen, end, strlen(end) + 1);
         if (repl) {
           memcpy(ptr, repl, replLen);
         }
-        ptr                  += replLen;
+        ptr                  += replLen - 1;
       }
       break;
     case '\\':
@@ -1071,7 +1204,7 @@ static void execService(int width, int height, struct Service *service,
         } else {
           // Add entry to argv.
           state               = ARGS;
-          argv[argc++]        = key;
+          argv[argc++]        = strdup(key);
           check(argv          = realloc(argv, (argc + 1)*sizeof(char *)));
         }
       }
@@ -1086,6 +1219,7 @@ static void execService(int width, int height, struct Service *service,
     }
   }
  done:
+  free(cmdline);
   argv[argc]                  = NULL;
   deleteHashMap(vars);
   check(argc);
@@ -1098,17 +1232,30 @@ static void execService(int width, int height, struct Service *service,
 
 void setWindowSize(int pty, int width, int height) {
   if (width > 0 && height > 0) {
-    struct winsize win;
-    win.ws_row    = height;
-    win.ws_col    = width;
-    win.ws_xpixel = 0;
-    win.ws_ypixel = 0;
-    ioctl(pty, TIOCSWINSZ, &win);
+    #ifdef TIOCSSIZE
+    {
+      struct ttysize win;
+      ioctl(pty, TIOCGSIZE, &win);
+      win.ts_lines = height;
+      win.ts_cols  = width;
+      ioctl(pty, TIOCSSIZE, &win);
+    }
+    #endif
+    #ifdef TIOCGWINSZ
+    {
+      struct winsize win;
+      ioctl(pty, TIOCGWINSZ, &win);
+      win.ws_row   = height;
+      win.ws_col   = width;
+      ioctl(pty, TIOCSWINSZ, &win);
+    }
+    #endif
   }
 }
 
 static void childProcess(struct Service *service, int width, int height,
-                         struct Utmp *utmp, const char *peerName) {
+                         struct Utmp *utmp, const char *peerName,
+                         const char *url) {
   // Set initial window size
   setWindowSize(0, width, height);
 
@@ -1228,13 +1375,13 @@ static void childProcess(struct Service *service, int width, int height,
   }
 
   // Finally, launch the child process.
-  if (service->useLogin) {
+  if (service->useLogin == 1) {
     execle("/bin/login", "login", "-p", "-h", peerName,
            (void *)0, environment);
     execle("/usr/bin/login", "login", "-p", "-h", peerName,
            (void *)0, environment);
   } else {
-    execService(width, height, service, peerName, environment);
+    execService(width, height, service, peerName, environment, url);
   }
   _exit(1);
 }
@@ -1254,6 +1401,9 @@ static void launcherDaemon(int fd) {
     errno                     = 0;
     int len                   = read(fd, &request, sizeof(request));
     if (len != sizeof(request) && errno != EINTR) {
+      if (len) {
+        debug("Failed to read launch request");
+      }
       break;
     }
 
@@ -1270,6 +1420,26 @@ static void launcherDaemon(int fd) {
     }
     if (len != sizeof(request)) {
       continue;
+    }
+
+    char *url;
+    check(url                 = calloc(request.urlLength + 1, 1));
+  readURL:
+    len                       = read(fd, url, request.urlLength + 1);
+    if (len != request.urlLength + 1 && errno != EINTR) {
+      debug("Failed to read URL");
+      free(url);
+      break;
+    }
+    while (NOINTR(pid = waitpid(-1, &status, WNOHANG)) > 0) {
+      if (WIFEXITED(pid) || WIFSIGNALED(pid)) {
+        char key[32];
+        snprintf(&key[0], sizeof(key), "%d", pid);
+        deleteFromHashMap(childProcesses, key);
+      }
+    }
+    if (len != request.urlLength + 1) {
+      goto readURL;
     }
 
     check(request.service >= 0);
@@ -1294,11 +1464,13 @@ static void launcherDaemon(int fd) {
                                         services[request.service]->useLogin,
                                         &utmp, request.peerName)) == 0) {
       childProcess(services[request.service], request.width, request.height,
-                   utmp, request.peerName);
+                   utmp, request.peerName, url);
+      free(url);
       _exit(1);
     } else {
       // Remember the utmp entry so that we can clean up when the child
       // terminates.
+      free(url);
       if (pid > 0) {
         if (!childProcesses) {
           childProcesses      = newHashMap(destroyUtmpHashEntry, NULL);
@@ -1329,7 +1501,7 @@ static void launcherDaemon(int fd) {
       cmsg->cmsg_level        = SOL_SOCKET;
       cmsg->cmsg_type         = SCM_RIGHTS;
       cmsg->cmsg_len          = CMSG_LEN(sizeof(int));
-      *(int *)CMSG_DATA(cmsg) = pty;
+      memcpy(CMSG_DATA(cmsg), &pty, sizeof(int));
       if (NOINTR(sendmsg(fd, &msg, 0)) != sizeof(pid)) {
         break;
       }

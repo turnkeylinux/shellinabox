@@ -2,13 +2,13 @@ Source: shellinabox
 Section: web
 Priority: optional
 Maintainer: Markus Gutschke <markus@shellinabox.com>
-Build-Depends: debhelper (>= 4.0.0), binutils, libssl-dev, libpam0g-dev
+Build-Depends: debhelper (>= 4.0.0), binutils, libssl-dev, libpam0g-dev, zlib1g-dev
 Standards-Version: 3.6.1
 
 Package: shellinabox
 Section: web
 Architecture: any
-Depends: ${shlibs:Depends}, adduser
+Depends: ${shlibs:Depends}, adduser, lsb-base
 Recommends: libssl-dev, libpam0g-dev, openssl
 Description: publish command line shell through AJAX interface
  Shellinabox can export arbitrary command line programs to any JavaScript

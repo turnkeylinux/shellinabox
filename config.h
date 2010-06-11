@@ -5,7 +5,7 @@
 #define HAVE_DLFCN_H 1
 
 /* Define to 1 if you have the `dlopen' function. */
-#define HAVE_DLOPEN 1
+/* #undef HAVE_DLOPEN */
 
 /* Define to 1 if you have the `getgrgid_r' function. */
 #define HAVE_GETGRGID_R 1
@@ -106,6 +106,9 @@
 /* Define to 1 if you have the <utmp.h> header file. */
 #define HAVE_UTMP_H 1
 
+/* Define to 1 if zlib development files are installed */
+#define HAVE_ZLIB 1
+
 /* Define to the sub-directory in which libtool stores uninstalled libraries.
    */
 #define LT_OBJDIR ".libs/"
@@ -120,22 +123,25 @@
 #define PACKAGE_NAME "shellinabox"
 
 /* Define to the full name and version of this package. */
-#define PACKAGE_STRING "shellinabox 2.9"
+#define PACKAGE_STRING "shellinabox 2.10"
 
 /* Define to the one symbol short name of this package. */
 #define PACKAGE_TARNAME "shellinabox"
 
+/* Define to the home page for this package. */
+#define PACKAGE_URL ""
+
 /* Define to the version of this package. */
-#define PACKAGE_VERSION "2.9"
+#define PACKAGE_VERSION "2.10"
 
 /* Define to 1 if you have the ANSI C header files. */
 #define STDC_HEADERS 1
 
 /* Most recent revision number in the version control system */
-#define VCS_REVISION "139"
+#define VCS_REVISION "186"
 
 /* Version number of package */
-#define VERSION "2.9"
+#define VERSION "2.10"
 
 /* Define to empty if `const' does not conform to ANSI C. */
-/* #undef const */
+#define const /**/

@@ -91,8 +91,10 @@ function extend(subClass, baseClass) {
 
 function ShellInABox(url, container) {
   if (url == undefined) {
+    this.rooturl    = document.location.href;
     this.url        = document.location.href.replace(/[?#].*/, '');
   } else {
+    this.rooturl    = url;
     this.url        = url;
   }
   if (document.location.hash != '') {
@@ -168,7 +170,8 @@ ShellInABox.prototype.sendRequest = function(request) {
   var content                = 'width=' + this.terminalWidth +
                                '&height=' + this.terminalHeight +
                                (this.session ? '&session=' +
-                                encodeURIComponent(this.session) : '');
+                                encodeURIComponent(this.session) : '&rooturl='+
+                                encodeURIComponent(this.rooturl));
   request.setRequestHeader('Content-Length', content.length);
 
   request.onreadystatechange = function(shellInABox) {
@@ -333,7 +336,7 @@ ShellInABox.prototype.extendContextMenu = function(entries, actions) {
           // provide a menu entry to switch between the two.
           var newNode       = document.createElement('li');
           var isSecure;
-          if (document.location.href != '') {
+          if (document.location.hash != '') {
             isSecure        = !this.nextUrl.match(/\?plain$/);
           } else {
             isSecure        =  this.nextUrl.match(/^https:/);

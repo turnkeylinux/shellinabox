@@ -1,8 +1,8 @@
 AC_PREREQ(2.57)
 
 dnl This is the one location where the authoritative version number is stored
-AC_INIT(shellinabox, 2.9, markus@shellinabox.com)
-VCS_REVISION=139
+AC_INIT(shellinabox, 2.10, markus@shellinabox.com)
+VCS_REVISION=186
 AC_SUBST(VCS_REVISION)
 AC_DEFINE_UNQUOTED(VCS_REVISION, "${VCS_REVISION}",
                    [Most recent revision number in the version control system])
@@ -20,8 +20,8 @@ AC_C_CONST
 AC_PROG_GCC_TRADITIONAL
 
 dnl Check for header files that do not exist on all platforms
-AC_CHECK_HEADERS([libutil.h pthread.h pty.h sys/prctl.h sys/uio.h util.h      \
-                  utmp.h utmpx.h])
+AC_CHECK_HEADERS([libutil.h pthread.h pty.h strings.h sys/prctl.h sys/uio.h  \
+                  util.h utmp.h utmpx.h])
 
 dnl Most systems require linking against libutil.so in order to get login_tty()
 AC_CHECK_FUNCS(login_tty, [],
@@ -121,6 +121,12 @@ if test "x$enable_runtime_loading" == xno; then
     AC_CHECK_HEADER(security/pam_misc.h, [LIBS="-lpam_misc $LIBS"])
   fi
 fi
+
+AC_CHECK_LIB(z, deflate, [
+  AC_CHECK_HEADER(zlib.h, [LIBS="-lz $LIBS"
+                           AC_DEFINE(HAVE_ZLIB, 1,
+                           Define to 1 if zlib development files are installed)
+])])
 
 dnl Generate output files
 AC_CONFIG_FILES([Makefile])
