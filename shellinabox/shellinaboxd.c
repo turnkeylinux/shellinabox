@@ -1,6 +1,6 @@
 // shellinaboxd.c -- A custom web server that makes command line applications
 //                   available as AJAX web applications.
-// Copyright (C) 2008-2009 Markus Gutschke <markus@shellinabox.com>
+// Copyright (C) 2008-2010 Markus Gutschke <markus@shellinabox.com>
 //
 // This program is free software; you can redistribute it and/or modify
 // it under the terms of the GNU General Public License version 2 as
@@ -52,6 +52,8 @@
 #include <limits.h>
 #include <locale.h>
 #include <poll.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,6 +76,27 @@
 #include "shellinabox/session.h"
 #include "shellinabox/usercss.h"
 
+#ifdef HAVE_UNUSED
+#defined ATTR_UNUSED __attribute__((unused))
+#defined UNUSED(x)   do { } while (0)
+#else
+#define ATTR_UNUSED
+#define UNUSED(x)    do { (void)(x); } while (0)
+#endif
+
+// Embedded resources
+#include "shellinabox/beep.h"
+#include "shellinabox/cgi_root.h"
+#include "shellinabox/enabled.h"
+#include "shellinabox/favicon.h"
+#include "shellinabox/keyboard.h"
+#include "shellinabox/keyboard-layout.h"
+#include "shellinabox/print-styles.h"
+#include "shellinabox/root_page.h"
+#include "shellinabox/shell_in_a_box.h"
+#include "shellinabox/styles.h"
+#include "shellinabox/vt100.h"
+
 #define PORTNUM           4200
 #define MAX_RESPONSE      2048
 
@@ -94,6 +117,9 @@ static char           *cgiSessionKey;
 static int            cgiSessions;
 static char           *cssStyleSheet;
 static struct UserCSS *userCSSList;
+static const char     *pidfile;
+static sigjmp_buf     jmpenv;
+static volatile int   exiting;
 
 static char *jsonEscape(const char *buf, int len) {
   static const char *hexDigit = "0123456789ABCDEF";
@@ -263,7 +289,7 @@ static int handleSession(struct ServerConnection *connection, void *arg,
   if (len <= 0) {
     len                         = 1;
   }
-  char buf[len];
+  char buf[MAX_RESPONSE];
   int bytes                     = 0;
   if (revents & POLLIN) {
     bytes                       = NOINTR(read(session->pty, buf, len));
@@ -284,7 +310,7 @@ static int handleSession(struct ServerConnection *connection, void *arg,
                                                       session->pty);
     session->connection         = connection;
     if (session->len >= MAX_RESPONSE) {
-      serverConnectionSetEvents(session->server, connection, 0);
+      *events                   = 0;
     }
     serverSetTimeout(connection, AJAX_TIMEOUT);
     return 1;
@@ -310,7 +336,8 @@ static int invalidatePendingHttpSession(void *arg, const char *key,
 }
 
 static int dataHandler(HttpConnection *http, struct Service *service,
-                       const char *buf, int len, URL *url) {
+                       const char *buf, int len ATTR_UNUSED, URL *url) {
+  UNUSED(len);
   if (!buf) {
     // Somebody unexpectedly closed our http connection (e.g. because of a
     // timeout). This is the last notification that we will get.
@@ -432,13 +459,15 @@ static int dataHandler(HttpConnection *http, struct Service *service,
       serverSetTimeout(session->connection, AJAX_TIMEOUT);
       if (session->len < MAX_RESPONSE) {
         // Re-enable input on the child's pty
-        serverConnectionSetEvents(session->server, session->connection,POLLIN);
+        serverConnectionSetEvents(session->server, session->connection,
+                                  session->pty, POLLIN);
       }
     }
     return HTTP_DONE;
   } else if (session->connection) {
     // Re-enable input on the child's pty
-    serverConnectionSetEvents(session->server, session->connection, POLLIN);
+    serverConnectionSetEvents(session->server, session->connection,
+                              session->pty, POLLIN);
     serverSetTimeout(session->connection, AJAX_TIMEOUT);
   }
 
@@ -514,13 +543,13 @@ static void serveStaticFile(HttpConnection *http, const char *contentType,
           // Remember the beginning of the "[if ...]" statement
           ifPtr                  = ptr;
         }
-      } else if (ifPtr && !elsePtr && eol - ptr >= strlen(tag) + 7 &&
+      } else if (ifPtr && !elsePtr && eol - ptr >= (ssize_t)strlen(tag) + 7 &&
                  !memcmp(ptr, "[else ", 6) &&
                  !memcmp(ptr + 6, tag, strlen(tag)) &&
                  ptr[6 + strlen(tag)] == ']') {
         // Found an "[else ...]" statement. Remember where it started.
         elsePtr                  = ptr;
-      } else if (ifPtr && eol - ptr >= strlen(tag) + 8 &&
+      } else if (ifPtr && eol - ptr >= (ssize_t)strlen(tag) + 8 &&
                  !memcmp(ptr, "[endif ", 7) &&
                  !memcmp(ptr + 7, tag, strlen(tag)) &&
                  ptr[7 + strlen(tag)] == ']') {
@@ -577,13 +606,6 @@ static void serveStaticFile(HttpConnection *http, const char *contentType,
   httpTransfer(http, response, len);
 }
 
-static const char *addr(const char *a) {
-  // Work-around for a gcc bug that could occasionally generate invalid
-  // assembly instructions when optimizing code too agressively.
-  asm volatile("");
-  return a;
-}
-
 static int shellInABoxHttpHandler(HttpConnection *http, void *arg,
                                   const char *buf, int len) {
   checkGraveyard();
@@ -591,17 +613,16 @@ static int shellInABoxHttpHandler(HttpConnection *http, void *arg,
   const HashMap *headers  = httpGetHeaders(http);
   const char *contentType = getFromHashMap(headers, "content-type");
 
-  // Normalize the path info
+  // Normalize the path info, present the final path element
   const char *pathInfo    = urlGetPathInfo(url);
-  while (*pathInfo == '/') {
-    pathInfo++;
+  int pathInfoLength = 0;
+  pathInfo = strrchr (pathInfo, '/');
+  if (pathInfo) {
+    ++pathInfo;
+  } else {
+    pathInfo = "";              // Cheap way to get an empty string
   }
-  const char *endPathInfo;
-  for (endPathInfo        = pathInfo;
-       *endPathInfo && *endPathInfo != '/';
-       endPathInfo++) {
-  }
-  int pathInfoLength      = endPathInfo - pathInfo;
+  pathInfoLength = strlen (pathInfo);
 
   if (!pathInfoLength ||
       (pathInfoLength == 5 && !memcmp(pathInfo, "plain", 5)) ||
@@ -613,39 +634,33 @@ static int shellInABoxHttpHandler(HttpConnection *http, void *arg,
       // client session.
       return dataHandler(http, arg, buf, len, url);
     }
-    extern char rootPageStart[];
-    extern char rootPageEnd[];
-    char *rootPage;
-    check(rootPage = malloc(rootPageEnd - rootPageStart + 1));
-    memcpy(rootPage, rootPageStart, rootPageEnd - rootPageStart);
-    rootPage[rootPageEnd - rootPageStart] = '\000';
-    char *html            = stringPrintf(NULL, rootPage,
+    UNUSED(rootPageSize);
+    char *html            = stringPrintf(NULL, rootPageStart,
                                          enableSSL ? "true" : "false");
     serveStaticFile(http, "text/html", html, strrchr(html, '\000'));
     free(html);
-    free(rootPage);
   } else if (pathInfoLength == 8 && !memcmp(pathInfo, "beep.wav", 8)) {
     // Serve the audio sample for the console bell.
-    extern char beepStart[];
-    extern char beepEnd[];
-    serveStaticFile(http, "audio/x-wav", beepStart, beepEnd);
+    serveStaticFile(http, "audio/x-wav", beepStart, beepStart + beepSize - 1);
   } else if (pathInfoLength == 11 && !memcmp(pathInfo, "enabled.gif", 11)) {
     // Serve the checkmark icon used in the context menu
-    extern char enabledStart[];
-    extern char enabledEnd[];
-    serveStaticFile(http, "image/gif", enabledStart, enabledEnd);
+    serveStaticFile(http, "image/gif", enabledStart,
+                    enabledStart + enabledSize - 1);
   } else if (pathInfoLength == 11 && !memcmp(pathInfo, "favicon.ico", 11)) {
     // Serve the favicon
-    extern char faviconStart[];
-    extern char faviconEnd[];
-    serveStaticFile(http, "image/x-icon", faviconStart, faviconEnd);
+    serveStaticFile(http, "image/x-icon", faviconStart,
+                    faviconStart + faviconSize - 1);
+  } else if (pathInfoLength == 13 && !memcmp(pathInfo, "keyboard.html", 13)) {
+    // Serve the keyboard layout
+    serveStaticFile(http, "text/html", keyboardLayoutStart,
+                    keyboardLayoutStart + keyboardLayoutSize - 1);
+  } else if (pathInfoLength == 12 && !memcmp(pathInfo, "keyboard.png", 12)) {
+    // Serve the keyboard icon
+    serveStaticFile(http, "image/png", keyboardStart,
+                    keyboardStart + keyboardSize - 1);
   } else if (pathInfoLength == 14 && !memcmp(pathInfo, "ShellInABox.js", 14)) {
     // Serve both vt100.js and shell_in_a_box.js in the same transaction.
     // Also, indicate to the client whether the server is SSL enabled.
-    extern char vt100Start[];
-    extern char vt100End[];
-    extern char shellInABoxStart[];
-    extern char shellInABoxEnd[];
     char *userCSSString   = getUserCSSString(userCSSList);
     char *stateVars       = stringPrintf(NULL,
                                          "serverSupportsSSL = %s;\n"
@@ -660,8 +675,8 @@ static int shellInABoxHttpHandler(HttpConnection *http, void *arg,
     free(userCSSString);
     int stateVarsLength   = strlen(stateVars);
     int contentLength     = stateVarsLength +
-                            (addr(vt100End) - addr(vt100Start)) +
-                            (addr(shellInABoxEnd) - addr(shellInABoxStart));
+                            vt100Size - 1 +
+                            shellInABoxSize - 1;
     char *response        = stringPrintf(NULL,
                              "HTTP/1.1 200 OK\r\n"
                              "Content-Type: text/javascript; charset=utf-8\r\n"
@@ -673,8 +688,8 @@ static int shellInABoxHttpHandler(HttpConnection *http, void *arg,
       check(response      = realloc(response, headerLength + contentLength));
       memcpy(memcpy(memcpy(
           response + headerLength, stateVars, stateVarsLength)+stateVarsLength,
-        vt100Start, vt100End - vt100Start) + (vt100End - vt100Start),
-      shellInABoxStart, shellInABoxEnd - shellInABoxStart);
+        vt100Start, vt100Size - 1) + vt100Size - 1,
+      shellInABoxStart, shellInABoxSize - 1);
     } else {
       contentLength       = 0;
     }
@@ -686,10 +701,8 @@ static int shellInABoxHttpHandler(HttpConnection *http, void *arg,
                     cssStyleSheet, strrchr(cssStyleSheet, '\000'));
   } else if (pathInfoLength == 16 && !memcmp(pathInfo, "print-styles.css",16)){
     // Serve the style sheet.
-    extern char printStylesStart[];
-    extern char printStylesEnd[];
     serveStaticFile(http, "text/css; charset=utf-8",
-                    printStylesStart, printStylesEnd);
+                    printStylesStart, printStylesStart + printStylesSize - 1);
   } else if (pathInfoLength > 8 && !memcmp(pathInfo, "usercss-", 8)) {
     // Server user style sheets (if any)
     struct UserCSS *css   = userCSSList;
@@ -750,6 +763,7 @@ static void usage(void) {
           "      --localhost-only        only listen on 127.0.0.1\n"
           "      --no-beep               suppress all audio output\n"
           "  -n, --numeric               do not resolve hostnames\n"
+          "      --pidfile=PIDFILE       publish pid of daemon process\n"
           "  -p, --port=PORT             select a port (default: %d)\n"
           "  -s, --service=SERVICE       define one or more services\n"
           "%s"
@@ -765,10 +779,15 @@ static void usage(void) {
           "be made available\n"
           "through the web interface:\n"
           "  SERVICE := <url-path> ':' APP\n"
-          "  APP     := 'LOGIN' | 'SSH' [ : <host> ] | "
-                        "USER ':' CWD ':' <cmdline>\n"
+          "  APP     := "
+#ifdef HAVE_BIN_LOGIN
+                        "'LOGIN' | "
+#endif
+                                   "'SSH' [ : <host> ] | "
+                        "USER ':' CWD ':' CMD\n"
           "  USER    := %s<username> ':' <groupname>\n"
           "  CWD     := 'HOME' | <dir>\n"
+          "  CMD     := 'SHELL' | <cmdline>\n"
           "\n"
           "<cmdline> supports variable expansion:\n"
           "  ${columns} - number of columns\n"
@@ -804,9 +823,18 @@ static void usage(void) {
   free((char *)group);
 }
 
-static void destroyExternalFileHashEntry(void *arg, char *key, char *value) {
+static void destroyExternalFileHashEntry(void *arg ATTR_UNUSED, char *key,
+                                         char *value) {
+  UNUSED(arg);
   free(key);
   free(value);
+}
+
+static void sigHandler(int signo, siginfo_t *info, void *context) {
+  if (exiting++) {
+    _exit(1);
+  }
+  siglongjmp(jmpenv, 1);
 }
 
 static void parseArgs(int argc, char * const argv[]) {
@@ -816,15 +844,11 @@ static void parseArgs(int argc, char * const argv[]) {
   }
   int demonize             = 0;
   int cgi                  = 0;
-  const char *pidfile      = NULL;
   int verbosity            = MSG_DEFAULT;
   externalFiles            = newHashMap(destroyExternalFileHashEntry, NULL);
   HashMap *serviceTable    = newHashMap(destroyServiceHashEntry, NULL);
-  extern char stylesStart[];
-  extern char stylesEnd[];
-  check(cssStyleSheet      = malloc(stylesEnd - stylesStart + 1));
-  memcpy(cssStyleSheet, stylesStart, stylesEnd - stylesStart);
-  cssStyleSheet[stylesEnd - stylesStart] = '\000';
+  UNUSED(stylesSize);
+  check(cssStyleSheet      = strdup(stylesStart));
 
   for (;;) {
     static const char optstring[] = "+hb::c:df:g:np:s:tqu:v";
@@ -842,6 +866,7 @@ static void parseArgs(int argc, char * const argv[]) {
       { "localhost-only",   0, 0,  0  },
       { "no-beep",          0, 0,  0  },
       { "numeric",          0, 0, 'n' },
+      { "pidfile",          1, 0,  0  },
       { "port",             1, 0, 'p' },
       { "service",          1, 0, 's' },
       { "disable-ssl",      0, 0, 't' },
@@ -881,7 +906,7 @@ static void parseArgs(int argc, char * const argv[]) {
         fatal("Only one pidfile can be given");
       }
       if (optarg && *optarg) {
-        pidfile            = strdup(optarg);
+        check(pidfile     = strdup(optarg));
       }
     } else if (!idx--) {
       // Certificate
@@ -933,7 +958,7 @@ static void parseArgs(int argc, char * const argv[]) {
                                      st.st_size + 2));
         char *newData      = strrchr(cssStyleSheet, '\000');
         *newData++         = '\n';
-        if (fread(newData, 1, st.st_size, css) != st.st_size) {
+        if (fread(newData, st.st_size, 1, css) != 1) {
           fatal("Failed to read style sheet \"%s\"", optarg);
         }
         newData[st.st_size]= '\000';
@@ -943,6 +968,9 @@ static void parseArgs(int argc, char * const argv[]) {
       // CGI
       if (demonize) {
         fatal("CGI and background operations are mutually exclusive");
+      }
+      if (pidfile) {
+        fatal("CGI operation and --pidfile= are mutually exclusive");
       }
       if (port) {
         fatal("Cannot specify a port for CGI operation");
@@ -974,7 +1002,7 @@ static void parseArgs(int argc, char * const argv[]) {
       check(path           = malloc(ptr - optarg + 1));
       memcpy(path, optarg, ptr - optarg);
       path[ptr - optarg]   = '\000';
-      file                 = strdup(ptr + 1);
+      check(file           = strdup(ptr + 1));
       if (getRefFromHashMap(externalFiles, path)) {
         fatal("Duplicate static-file definition for \"%s\".", path);
       }
@@ -987,7 +1015,7 @@ static void parseArgs(int argc, char * const argv[]) {
       if (!optarg || !*optarg) {
         fatal("\"--group\" expects a group name.");
       }
-      runAsGroup           = parseGroup(optarg, NULL);
+      runAsGroup           = parseGroupArg(optarg, NULL);
     } else if (!idx--) {
       // Linkify
       if (!strcmp(optarg, "none")) {
@@ -1009,6 +1037,18 @@ static void parseArgs(int argc, char * const argv[]) {
     } else if (!idx--) {
       // Numeric
       numericHosts         = 1;
+    } else if (!idx--) {
+      // Pidfile
+      if (cgi) {
+        fatal("CGI operation and --pidfile= are mutually exclusive");
+      }
+      if (!optarg || !*optarg) {
+        fatal("Must specify a filename for --pidfile= option");
+      }
+      if (pidfile) {
+        fatal("Only one pidfile can be given");
+      }
+      check(pidfile        = strdup(optarg));
     } else if (!idx--) {
       // Port
       if (port) {
@@ -1057,7 +1097,7 @@ static void parseArgs(int argc, char * const argv[]) {
       if (!optarg || !*optarg) {
         fatal("\"--user\" expects a user name.");
       }
-      runAsUser            = parseUser(optarg, NULL);
+      runAsUser            = parseUserArg(optarg, NULL);
     } else if (!idx--) {
       // User CSS
       if (!optarg || !*optarg) {
@@ -1096,8 +1136,14 @@ static void parseArgs(int argc, char * const argv[]) {
 
   // If the user did not register any services, provide the default service
   if (!getHashmapSize(serviceTable)) {
-    addToHashMap(serviceTable, "/", (char *)newService(geteuid() ? ":SSH" :
-                                                                   ":LOGIN"));
+    addToHashMap(serviceTable, "/",
+                 (char *)newService(
+#ifdef HAVE_BIN_LOGIN
+                                    geteuid() ? ":SSH" : ":LOGIN"
+#else
+                                    ":SSH"
+#endif
+                                    ));
   }
   enumerateServices(serviceTable);
   deleteHashMap(serviceTable);
@@ -1119,26 +1165,28 @@ static void parseArgs(int argc, char * const argv[]) {
       _exit(0);
     }
     setsid();
-    if (pidfile) {
+  }
+  if (pidfile) {
 #ifndef O_LARGEFILE
 #define O_LARGEFILE 0
 #endif
-      int fd               = NOINTR(open(pidfile,
+    int fd                 = NOINTR(open(pidfile,
                                          O_WRONLY|O_TRUNC|O_LARGEFILE|O_CREAT,
                                          0644));
-      if (fd >= 0) {
-        char buf[40];
-        NOINTR(write(fd, buf, snprintf(buf, 40, "%d", (int)getpid())));
-        check(!NOINTR(close(fd)));
-      }
+    if (fd >= 0) {
+      char buf[40];
+      NOINTR(write(fd, buf, snprintf(buf, 40, "%d", (int)getpid())));
+      check(!NOINTR(close(fd)));
+    } else {
+      free((char *)pidfile);
+      pidfile              = NULL;
     }
   }
-  free((char *)pidfile);
 }
 
 static void removeLimits() {
   static int res[] = { RLIMIT_CPU, RLIMIT_DATA, RLIMIT_FSIZE, RLIMIT_NPROC };
-  for (int i = 0; i < sizeof(res)/sizeof(int); i++) {
+  for (unsigned i = 0; i < sizeof(res)/sizeof(int); i++) {
     struct rlimit rl;
     getrlimit(res[i], &rl);
     if (rl.rlim_max < RLIM_INFINITY) {
@@ -1224,19 +1272,13 @@ int main(int argc, char * const argv[]) {
 
     // Output a <frameset> that includes our root page
     check(port    = serverGetListeningPort(server));
-    extern char cgiRootStart[];
-    extern char cgiRootEnd[];
-    char *cgiRoot;
-    check(cgiRoot = malloc(cgiRootEnd - cgiRootStart + 1));
-    memcpy(cgiRoot, cgiRootStart, cgiRootEnd - cgiRootStart);
-    cgiRoot[cgiRootEnd - cgiRootStart] = '\000';
     printf("X-ShellInABox-Port: %d\r\n"
            "X-ShellInABox-Pid: %d\r\n"
            "Content-type: text/html; charset=utf-8\r\n\r\n",
            port, getpid());
-    printfUnchecked(cgiRoot, port, cgiSessionKey);
+    UNUSED(cgiRootSize);
+    printfUnchecked(cgiRootStart, port, cgiSessionKey);
     fflush(stdout);
-    free(cgiRoot);
     check(!NOINTR(close(fds[1])));
     closeAllFds((int []){ launcherFd, serverGetFd(server) }, 2);
     logSetLogLevel(MSG_QUIET);
@@ -1259,7 +1301,20 @@ int main(int argc, char * const argv[]) {
   iterateOverHashMap(externalFiles, registerExternalFiles, server);
 
   // Start the server
-  serverLoop(server);
+  if (!sigsetjmp(jmpenv, 1)) {
+    // Clean up upon orderly shut down. Do _not_ cleanup if we die
+    // unexpectedly, as we cannot guarantee if we are still in a valid
+    // static. This means, we should never catch SIGABRT.
+    static const int signals[] = { SIGHUP, SIGINT, SIGQUIT, SIGTERM };
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = sigHandler;
+    sa.sa_flags   = SA_SIGINFO | SA_RESETHAND;
+    for (int i = 0; i < sizeof(signals)/sizeof(*signals); ++i) {
+      sigaction(signals[i], &sa, NULL);
+    }
+    serverLoop(server);
+  }
 
   // Clean up
   deleteServer(server);
@@ -1271,6 +1326,27 @@ int main(int argc, char * const argv[]) {
   free(services);
   free(certificateDir);
   free(cgiSessionKey);
+  if (pidfile) {
+    // As a convenience, remove the pidfile, if it is still the version that
+    // we wrote. In general, pidfiles are not expected to be incredibly
+    // reliable, as there is no way to properly deal with multiple programs
+    // accessing the same pidfile. But we at least make a best effort to be
+    // good citizens.
+    char buf[40];
+    int fd        = open(pidfile, O_RDONLY);
+    if (fd >= 0) {
+      ssize_t sz;
+      NOINTR(sz   = read(fd, buf, sizeof(buf)-1));
+      NOINTR(close(fd));
+      if (sz > 0) {
+        buf[sz]   = '\000';
+        if (atoi(buf) == getpid()) {
+          unlink(pidfile);
+        }
+      }
+    }
+    free((char *)pidfile);
+  }
   info("Done");
   _exit(0);
 }

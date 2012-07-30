@@ -1,5 +1,5 @@
 // service.c -- Service descriptions
-// Copyright (C) 2008-2009 Markus Gutschke <markus@shellinabox.com>
+// Copyright (C) 2008-2010 Markus Gutschke <markus@shellinabox.com>
 //
 // This program is free software; you can redistribute it and/or modify
 // it under the terms of the GNU General Public License version 2 as
@@ -55,6 +55,13 @@
 #include "shellinabox/privileges.h"
 #include "shellinabox/service.h"
 
+#ifdef HAVE_UNUSED
+#defined ATTR_UNUSED __attribute__((unused))
+#defined UNUSED(x)   do { } while (0)
+#else
+#define ATTR_UNUSED
+#define UNUSED(x)    do { (void)(x); } while (0)
+#endif
 
 struct Service **services;
 int            numServices;
@@ -83,6 +90,7 @@ void initService(struct Service *service, const char *arg) {
   }
   arg                                       = ptr + 1;
 
+#ifdef HAVE_BIN_LOGIN
   // The next part of the argument is either the word 'LOGIN' or the
   // application definition.
   if (!strcmp(arg, "LOGIN")) {
@@ -93,6 +101,7 @@ void initService(struct Service *service, const char *arg) {
     service->useLogin                       = 1;
     service->useHomeDir                     = 0;
     service->authUser                       = 0;
+    service->useDefaultShell                = 0;
     service->uid                            = 0;
     service->gid                            = 0;
     check(service->user                     = strdup("root"));
@@ -100,10 +109,13 @@ void initService(struct Service *service, const char *arg) {
     check(service->cwd                      = strdup("/"));
     check(service->cmdline                  = strdup(
                                                   "/bin/login -p -h ${peer}"));
-  } else if (!strcmp(arg, "SSH") || !strncmp(arg, "SSH:", 4)) {
+  } else
+#endif
+  if (!strcmp(arg, "SSH") || !strncmp(arg, "SSH:", 4)) {
     service->useLogin                       = 0;
     service->useHomeDir                     = 0;
     service->authUser                       = 2;
+    service->useDefaultShell                = 0;
     service->uid                            = -1;
     service->gid                            = -1;
     service->user                           = NULL;
@@ -147,7 +159,11 @@ void initService(struct Service *service, const char *arg) {
           "-oPubkeyAuthentication=no -oRhostsRSAAuthentication=no "
           "-oRSAAuthentication=no -oStrictHostKeyChecking=no -oTunnel=no "
           "-oUserKnownHostsFile=/dev/null -oVerifyHostKeyDNS=no "
-          "-oVisualHostKey=no -oLogLevel=QUIET %%s@%s", host);
+// beewoolie-2012.03.30: while it would be nice to disable this
+//          feature, we cannot be sure that it is available on the
+//          target server.  Removing it for the sake of Centos.
+//          "-oVisualHostKey=no"
+	  " -oLogLevel=QUIET %%s@%s", host);
     free(host);
   } else {
     service->useLogin                       = 0;
@@ -168,7 +184,8 @@ void initService(struct Service *service, const char *arg) {
       service->authUser                     = 0;
 
       // Numeric or symbolic user id
-      service->uid                          = parseUser(arg, &service->user);
+      service->uid                          = parseUserArg(arg,
+                                                           &service->user);
       *ptr                                  = ':';
       arg                                   = ptr + 1;
 
@@ -177,7 +194,8 @@ void initService(struct Service *service, const char *arg) {
         goto error;
       }
       *ptr                                  = '\000';
-      service->gid                          = parseGroup(arg, &service->group);
+      service->gid                          = parseGroupArg(arg,
+                                                            &service->group);
     }
     *ptr                                    = ':';
     arg                                     = ptr + 1;
@@ -204,7 +222,13 @@ void initService(struct Service *service, const char *arg) {
     if (!*arg) {
       goto error;
     }
-    check(service->cmdline                  = strdup(arg));
+    if (!strcmp(arg, "SHELL")) {
+      service->useDefaultShell              = 1;
+      service->cmdline                      = NULL;
+    } else {
+      service->useDefaultShell              = 0;
+      check(service->cmdline                = strdup(arg));
+    }
   }
   free(desc);
 }
@@ -231,10 +255,18 @@ void deleteService(struct Service *service) {
   free(service);
 }
 
-void destroyServiceHashEntry(void *arg, char *key, char *value) {
+void destroyServiceHashEntry(void *arg ATTR_UNUSED, char *key ATTR_UNUSED,
+                             char *value ATTR_UNUSED) {
+  UNUSED(arg);
+  UNUSED(key);
+  UNUSED(value);
 }
 
-static int enumerateServicesHelper(void *arg, const char *key, char **value) {
+static int enumerateServicesHelper(void *arg ATTR_UNUSED,
+                                   const char *key ATTR_UNUSED, char **value) {
+  UNUSED(arg);
+  UNUSED(key);
+
   check(services              = realloc(services,
                                     ++numServices * sizeof(struct Service *)));
   services[numServices-1]     = *(struct Service **)value;

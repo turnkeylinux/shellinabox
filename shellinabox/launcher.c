@@ -1,5 +1,5 @@
 // launcher.c -- Launch services from a privileged process
-// Copyright (C) 2008-2009 Markus Gutschke <markus@shellinabox.com>
+// Copyright (C) 2008-2010 Markus Gutschke <markus@shellinabox.com>
 //
 // This program is free software; you can redistribute it and/or modify
 // it under the terms of the GNU General Public License version 2 as
@@ -99,6 +99,10 @@
 #if defined(HAVE_SECURITY_PAM_MISC_H)
 #include <security/pam_misc.h>
 #endif
+
+#ifndef PAM_DATA_SILENT
+#define PAM_DATA_SILENT 0
+#endif
 #else
 struct pam_message;
 struct pam_response;
@@ -115,6 +119,14 @@ typedef struct pam_handle pam_handle_t;
 #include "shellinabox/service.h"
 #include "libhttp/hashmap.h"
 #include "logging/logging.h"
+
+#ifdef HAVE_UNUSED
+#defined ATTR_UNUSED __attribute__((unused))
+#defined UNUSED(x)   do { } while (0)
+#else
+#define ATTR_UNUSED
+#define UNUSED(x)    do { (void)(x); } while (0)
+#endif
 
 #undef pthread_once
 #undef execle
@@ -158,6 +170,92 @@ static int (*x_misc_conv)(int, const struct pam_message **,
 static int   launcher = -1;
 static uid_t restricted;
 
+// MacOS X has a somewhat unusual definition of getgrouplist() which can
+// trigger a compile warning.
+#if defined(HAVE_GETGROUPLIST_TAKES_INTS)
+static int x_getgrouplist(const char *user, gid_t group,
+                          gid_t *groups, int *ngroups) {
+  return getgrouplist(user, (int)group, (int *)groups, ngroups);
+}
+#define getgrouplist x_getgrouplist
+#endif
+
+// BSD systems have special requirements on how utmp entries have to be filled
+// out in order to be updated by non-privileged users. In particular, they
+// want the real user name in the utmp recode.
+// This all wouldn't be so bad, if pututxline() wouldn't print an error message
+// to stderr, if it fails to run. Unfortunately, it has been observed to do so.
+// That means, we need to jump through some hoops to intercept these messages.
+#ifdef HAVE_UTMPX_H
+struct utmpx *x_pututxline(struct utmpx *ut) {
+  // N.B. changing global file descriptors isn't thread safe. But all call
+  // sites are guaranteed to be single-threaded. If that ever changes, this
+  // code will need rewriting.
+  int oldStdin         = dup(0);
+  int oldStdout        = dup(1);
+  int oldStderr        = dup(2);
+  check(oldStdin > 2 && oldStdout > 2 && oldStderr > 2);
+  int nullFd           = open("/dev/null", O_RDWR);
+  check(nullFd > 2);
+  check(dup2(nullFd, 0) == 0);
+  NOINTR(close(nullFd));
+
+  // Set up a pipe so that we can read error messages that might be printed
+  // to stderr. We assume that the kernel maintains a buffer that is
+  // sufficiently large to receive the bytes written to it without causing
+  // the I/O operation to block.
+  int fds[2];
+  check(!pipe(fds));
+  check(dup2(fds[1], 1) == 1);
+  check(dup2(fds[1], 2) == 2);
+  NOINTR(close(fds[1]));
+  struct utmpx *ret    = pututxline(ut);
+  int err              = ret == NULL;
+
+  // Close the write end of the pipe, so that we can read until EOF.
+  check(dup2(0, 1) == 1);
+  check(dup2(0, 2) == 2);
+  char buf[128];
+  while (NOINTR(read(fds[0], buf, sizeof(buf))) > 0) {
+    err                = 1;
+  }
+  NOINTR(close(fds[0]));
+
+  // If we either received an error from pututxline() or if we saw an error
+  // message being written out, adjust the utmp record and retry.
+  if (err) {
+    uid_t uid          = getuid();
+    if (uid) {
+      // We only retry if the code is not running as root. Otherwise, fixing
+      // the utmp record is unlikely to do anything for us.
+      // If running as non-root, we set the actual user name in the utmp
+      // record. This is not ideal, but if it allows us to update the record
+      // then that's the best we do.
+      const char *user = getUserName(uid);
+      if (user) {
+        memset(&ut->ut_user[0], 0, sizeof(ut->ut_user));
+        strncat(&ut->ut_user[0], user, sizeof(ut->ut_user) - 1);
+        ret            = pututxline(ut);
+        free((char *)user);
+      }
+    }
+  }
+
+  // Clean up. Reset file descriptors back to their original values.
+  check(dup2(oldStderr, 2) == 2);
+  check(dup2(oldStdout, 1) == 1);
+  check(dup2(oldStdin,  0) == 0);
+  NOINTR(close(oldStdin));
+  NOINTR(close(oldStdout));
+  NOINTR(close(oldStderr));
+
+  // It is quite likely that we won't always be in a situation to update the
+  // system's utmp records. Return a non-fatal error to the caller.
+
+  return ret;
+}
+#define pututxline x_pututxline
+#endif
 
 // If the PAM misc library cannot be found, we have to provide our own basic
 // conversation function. As we know that this code is only ever called from
@@ -321,7 +419,7 @@ static void loadPAM(void) {
     { { &pam_start },             "libpam.so",      "pam_start"         },
     { { &misc_conv },             "libpam_misc.so", "misc_conv"         }
   };
-  for (int i = 0; i < sizeof(symbols)/sizeof(symbols[0]); i++) {
+  for (unsigned i = 0; i < sizeof(symbols)/sizeof(symbols[0]); i++) {
     if (!(*symbols[i].var = loadSymbol(symbols[i].lib, symbols[i].fn))) {
 #if defined(HAVE_SECURITY_PAM_CLIENT_H)
       if (!strcmp(symbols[i].fn, "pam_binary_handler_fn")) {
@@ -336,10 +434,10 @@ static void loadPAM(void) {
       }
       debug("Failed to load PAM support. Could not find \"%s\"",
             symbols[i].fn);
-      for (int j = 0; j < sizeof(symbols)/sizeof(symbols[0]); j++) {
+      for (unsigned j = 0; j < sizeof(symbols)/sizeof(symbols[0]); j++) {
         *symbols[j].var = NULL;
       }
-      break;
+      return;
     }
   }
   debug("Loaded PAM suppport");
@@ -419,7 +517,7 @@ int launchChild(int service, struct Session *session, const char *url) {
   }
 
   struct LaunchRequest *request;
-  size_t len           = sizeof(struct LaunchRequest) + strlen(u) + 1;
+  ssize_t len          = sizeof(struct LaunchRequest) + strlen(u) + 1;
   check(request        = calloc(len, 1));
   request->service     = service;
   request->width       = session->width;
@@ -475,11 +573,13 @@ void initUtmp(struct Utmp *utmp, int useLogin, const char *ptyPath,
   utmp->useLogin            = useLogin;
 #ifdef HAVE_UTMPX_H
   utmp->utmpx.ut_type       = useLogin ? LOGIN_PROCESS : USER_PROCESS;
-  dcheck(!strncmp(ptyPath, "/dev/pts", 8));
-  strncat(&utmp->utmpx.ut_line[0], ptyPath + 5,   sizeof(utmp->utmpx.ut_line));
-  strncat(&utmp->utmpx.ut_id[0],   ptyPath + 8,   sizeof(utmp->utmpx.ut_id));
-  strncat(&utmp->utmpx.ut_user[0], "SHELLINABOX", sizeof(utmp->utmpx.ut_user));
-  strncat(&utmp->utmpx.ut_host[0], peerName,      sizeof(utmp->utmpx.ut_host));
+  dcheck(!strncmp(ptyPath, "/dev/pts", 8) ||
+         !strncmp(ptyPath, "/dev/pty", 8) ||
+         !strncmp(ptyPath, "/dev/tty", 8));
+  strncat(&utmp->utmpx.ut_line[0], ptyPath + 5,   sizeof(utmp->utmpx.ut_line) - 1);
+  strncat(&utmp->utmpx.ut_id[0],   ptyPath + 8,   sizeof(utmp->utmpx.ut_id) - 1);
+  strncat(&utmp->utmpx.ut_user[0], "SHELLINABOX", sizeof(utmp->utmpx.ut_user) - 1);
+  strncat(&utmp->utmpx.ut_host[0], peerName,      sizeof(utmp->utmpx.ut_host) - 1);
   struct timeval tv;
   check(!gettimeofday(&tv, NULL));
   utmp->utmpx.ut_tv.tv_sec  = tv.tv_sec;
@@ -494,6 +594,28 @@ struct Utmp *newUtmp(int useLogin, const char *ptyPath,
   initUtmp(utmp, useLogin, ptyPath, peerName);
   return utmp;
 }
+
+#if defined(HAVE_UPDWTMP) && !defined(HAVE_UPDWTMPX)
+#define min(a,b) ({ typeof(a) _a=(a); typeof(b) _b=(b); _a < _b ? _a : _b; })
+#define updwtmpx x_updwtmpx
+
+static void updwtmpx(const char *wtmpx_file, const struct utmpx *utx) {
+  struct utmp ut   = { 0 };
+  ut.ut_type       = utx->ut_type;
+  ut.ut_pid        = utx->ut_pid;
+  ut.ut_tv.tv_sec  = utx->ut_tv.tv_sec;
+  ut.ut_tv.tv_usec = utx->ut_tv.tv_usec;
+  memcpy(&ut.ut_line, &utx->ut_line,
+         min(sizeof(ut.ut_line), sizeof(utx->ut_line)));
+  memcpy(&ut.ut_id, &utx->ut_id,
+         min(sizeof(ut.ut_id), sizeof(utx->ut_id)));
+  memcpy(&ut.ut_user, &utx->ut_user,
+         min(sizeof(ut.ut_user), sizeof(utx->ut_user)));
+  memcpy(&ut.ut_host, &utx->ut_host,
+         min(sizeof(ut.ut_host), sizeof(utx->ut_host)));
+  updwtmp(wtmpx_file, &ut);
+}
+#endif
 
 void destroyUtmp(struct Utmp *utmp) {
   if (utmp) {
@@ -518,9 +640,12 @@ void destroyUtmp(struct Utmp *utmp) {
       setutxent();
       pututxline(&utmp->utmpx);
       endutxent();
+
+#if defined(HAVE_UPDWTMP) || defined(HAVE_UPDWTMPX)
       if (!utmp->useLogin) {
         updwtmpx("/var/log/wtmp", &utmp->utmpx);
       }
+#endif
       
       // Switch back to the lower privileges
       check(!setresgid(r_gid, e_gid, s_gid));
@@ -537,7 +662,10 @@ void deleteUtmp(struct Utmp *utmp) {
   free(utmp);
 }
 
-static void destroyUtmpHashEntry(void *arg, char *key, char *value) {
+static void destroyUtmpHashEntry(void *arg ATTR_UNUSED, char *key ATTR_UNUSED,
+                                 char *value) {
+  UNUSED(arg);
+  UNUSED(key);
   deleteUtmp((struct Utmp *)value);
 }
 
@@ -593,7 +721,7 @@ void closeAllFds(int *exceptFds, int num) {
   }
 }
 
-#if !defined(HAVE_OPENPTY) && !defined(HAVE_PTSNAME_R)
+#if !defined(HAVE_PTSNAME_R)
 static int ptsname_r(int fd, char *buf, size_t buflen) {
   // It is unfortunate that ptsname_r is not universally available.
   // For the time being, this is not a big problem, as ShellInABox is
@@ -620,14 +748,44 @@ static int ptsname_r(int fd, char *buf, size_t buflen) {
 static int forkPty(int *pty, int useLogin, struct Utmp **utmp,
                    const char *peerName) {
   int slave;
-  char ptyPath[PATH_MAX];
   #ifdef HAVE_OPENPTY
-  if (openpty(pty, &slave, ptyPath, NULL, NULL) < 0) {
+  char* ptyPath = NULL;
+  if (openpty(pty, &slave, NULL, NULL, NULL) < 0) {
     *pty                    = -1;
     *utmp                   = NULL;
     return -1;
   }
+  // Recover name of PTY in a Hurd compatible way.  PATH_MAX doesn't
+  // exist, so we need to use ttyname_r to fetch the name of the
+  // pseudo-tty and find the buffer length that is sufficient. After
+  // finding an adequate buffer size for the ptyPath, we allocate it
+  // on the stack and release the freestore copy.  In this was we know
+  // that the memory won't leak.  Note that ptsname_r is not always
+  // available but we're already checking for this so it will be
+  // defined in any case.
+  {
+    size_t length = 32;
+    char* path = NULL;
+    while (path == NULL) {
+      path = malloc (length);
+      *path = 0;
+      if (ptsname_r (*pty, path, length)) {
+        if (errno == ERANGE) {
+          free (path);
+          path = NULL;
+        }
+        else
+          break;          // Every other error means no name for us
+      }
+      length <<= 1;
+    }
+    length = strlen (path);
+    ptyPath = alloca (length + 1);
+    strcpy (ptyPath, path);
+    free (path);
+  }
   #else
+  char ptyPath[PATH_MAX];
   if ((*pty                 = posix_openpt(O_RDWR|O_NOCTTY))          < 0 ||
       grantpt(*pty)                                                   < 0 ||
       unlockpt(*pty)                                                  < 0 ||
@@ -696,7 +854,7 @@ static int forkPty(int *pty, int useLogin, struct Utmp **utmp,
     // Become the session/process-group leader
     setsid();
     setpgid(0, 0);
-    
+
     // Redirect standard I/O to the pty
     dup2(slave, 0);
     dup2(slave, 1);
@@ -727,29 +885,34 @@ static const struct passwd *getPWEnt(uid_t uid) {
   struct passwd pwbuf, *pw;
   char *buf;
   #ifdef _SC_GETPW_R_SIZE_MAX
-  int len                   = sysconf(_SC_GETPW_R_SIZE_MAX);
+  int len                           = sysconf(_SC_GETPW_R_SIZE_MAX);
   if (len <= 0) {
-    len                     = 4096;
+    len                             = 4096;
   }
   #else
-  int len                   = 4096;
+  int len                           = 4096;
   #endif
-  check(buf                 = malloc(len));
+  check(buf                         = malloc(len));
   check(!getpwuid_r(uid, &pwbuf, buf, len, &pw) && pw);
+  if (!pw->pw_name  ) pw->pw_name   = (char *)"";
+  if (!pw->pw_passwd) pw->pw_passwd = (char *)"";
+  if (!pw->pw_gecos ) pw->pw_gecos  = (char *)"";
+  if (!pw->pw_dir   ) pw->pw_dir    = (char *)"";
+  if (!pw->pw_shell ) pw->pw_shell  = (char *)"";
   struct passwd *passwd;
-  check(passwd              = calloc(sizeof(struct passwd) +
-                                     strlen(pw->pw_name) +
-                                     strlen(pw->pw_passwd) +
-                                     strlen(pw->pw_gecos) +
-                                     strlen(pw->pw_dir) +
-                                     strlen(pw->pw_shell) + 5, 1));
-  passwd->pw_uid            = pw->pw_uid;
-  passwd->pw_gid            = pw->pw_gid;
-  strncat(passwd->pw_shell  = strrchr(
-  strncat(passwd->pw_dir    = strrchr(
-  strncat(passwd->pw_gecos  = strrchr(
-  strncat(passwd->pw_passwd = strrchr(
-  strncat(passwd->pw_name   = (char *)(passwd + 1),
+  check(passwd                      = calloc(sizeof(struct passwd) +
+                                             strlen(pw->pw_name) +
+                                             strlen(pw->pw_passwd) +
+                                             strlen(pw->pw_gecos) +
+                                             strlen(pw->pw_dir) +
+                                             strlen(pw->pw_shell) + 5, 1));
+  passwd->pw_uid                    = pw->pw_uid;
+  passwd->pw_gid                    = pw->pw_gid;
+  strncat(passwd->pw_shell          = strrchr(
+  strncat(passwd->pw_dir            = strrchr(
+  strncat(passwd->pw_gecos          = strrchr(
+  strncat(passwd->pw_passwd         = strrchr(
+  strncat(passwd->pw_name           = (char *)(passwd + 1),
          pw->pw_name,   strlen(pw->pw_name)),   '\000') + 1,
          pw->pw_passwd, strlen(pw->pw_passwd)), '\000') + 1,
          pw->pw_gecos,  strlen(pw->pw_gecos)),  '\000') + 1,
@@ -759,7 +922,11 @@ static const struct passwd *getPWEnt(uid_t uid) {
   return passwd;
 }
 
-static void sigAlrmHandler(int sig, siginfo_t *info, void *unused) {
+static void sigAlrmHandler(int sig ATTR_UNUSED, siginfo_t *info ATTR_UNUSED,
+                           void *unused ATTR_UNUSED) {
+  UNUSED(sig);
+  UNUSED(info);
+  UNUSED(unused);
   puts("\nLogin timed out after 60 seconds.");
   _exit(1);
 }
@@ -946,8 +1113,14 @@ static pam_handle_t *internalLogin(struct Service *service, struct Utmp *utmp,
   free((void *)fqdn);
   free((void *)hostname);
 
+  if (service->useDefaultShell) {
+    check(!service->cmdline);
+    service->cmdline           = strdup(*pw->pw_shell ?
+                                        pw->pw_shell : "/bin/sh");
+  }
+
   if (restricted &&
-      (service->uid != restricted || service->gid != pw->pw_gid)) {
+      (service->uid != (int)restricted || service->gid != (int)pw->pw_gid)) {
     puts("\nAccess denied!");
 #if defined(HAVE_SECURITY_PAM_APPL_H)
     if (service->authUser != 2 /* SSH */) {
@@ -993,7 +1166,7 @@ static pam_handle_t *internalLogin(struct Service *service, struct Utmp *utmp,
       if (i == ngroups) {
         groups[ngroups++]      = service->gid;
         break;
-      } else if (groups[i] == service->gid) {
+      } else if ((int)groups[i] == service->gid) {
         break;
       }
     }
@@ -1023,11 +1196,14 @@ static pam_handle_t *internalLogin(struct Service *service, struct Utmp *utmp,
   if (service->authUser != 2 /* SSH */) {
     memset(&utmp->utmpx.ut_user, 0, sizeof(utmp->utmpx.ut_user));
     strncat(&utmp->utmpx.ut_user[0], service->user,
-            sizeof(utmp->utmpx.ut_user));
+            sizeof(utmp->utmpx.ut_user) - 1);
     setutxent();
     pututxline(&utmp->utmpx);
     endutxent();
+
+#if defined(HAVE_UPDWTMP) || defined(HAVE_UPDWTMPX)
     updwtmpx("/var/log/wtmp", &utmp->utmpx);
+#endif
   }
 #endif
 
@@ -1035,14 +1211,19 @@ static pam_handle_t *internalLogin(struct Service *service, struct Utmp *utmp,
   return pam;
 }
 
-static void destroyVariableHashEntry(void *arg, char *key, char *value) {
+static void destroyVariableHashEntry(void *arg ATTR_UNUSED, char *key,
+                                     char *value) {
+  UNUSED(arg);
   free(key);
   free(value);
 }
 
-static void execService(int width, int height, struct Service *service,
-                        const char *peerName, char **environment,
-                        const char *url) {
+static void execService(int width ATTR_UNUSED, int height ATTR_UNUSED,
+                        struct Service *service, const char *peerName,
+                        char **environment, const char *url) {
+  UNUSED(width);
+  UNUSED(height);
+
   // Create a hash table with all the variables that we can expand. This
   // includes all environment variables being passed to the child.
   HashMap *vars;
@@ -1226,8 +1407,19 @@ static void execService(int width, int height, struct Service *service,
 
   extern char **environ;
   environ                     = environment;
-  char *cmd                   = strrchr(argv[0], '/');
-  execvp(cmd ? cmd + 1: argv[0], argv);
+  char *cmd                   = strdup(argv[0]);
+  char *slash                 = strrchr(argv[0], '/');
+  if (slash) {
+    memmove(argv[0], slash + 1, strlen(slash));
+  }
+  if (service->useDefaultShell) {
+    int len                   = strlen(argv[0]);
+    check(argv[0]             = realloc(argv[0], len + 2));
+    memmove(argv[0] + 1, argv[0], len);
+    argv[0][0]                = '-';
+    argv[0][len + 1]          = '\000';
+  }
+  execvp(cmd, argv);
 }
 
 void setWindowSize(int pty, int width, int height) {
@@ -1308,11 +1500,14 @@ static void childProcess(struct Service *service, int width, int height,
   }
   pututxline(&utmpx);
   endutxent();
+
+#if defined(HAVE_UPDWTMP) || defined(HAVE_UPDWTMPX)
   if (!utmp->useLogin) {
     memset(&utmpx.ut_user, 0, sizeof(utmpx.ut_user));
-    strncat(&utmpx.ut_user[0], "LOGIN", sizeof(utmpx.ut_user));
+    strncat(&utmpx.ut_user[0], "LOGIN", sizeof(utmpx.ut_user) - 1);
     updwtmpx("/var/log/wtmp", &utmpx);
   }
+#endif
 #endif
 
   // Create session. We might have to fork another process as PAM wants us
@@ -1324,7 +1519,10 @@ static void childProcess(struct Service *service, int width, int height,
     pam_handle_t *pam           = internalLogin(service, utmp, &environment);
 #if defined(HAVE_SECURITY_PAM_APPL_H)
     if (pam && !geteuid()) {
-      check(pam_open_session(pam, PAM_SILENT) == PAM_SUCCESS);
+      if (pam_open_session(pam, PAM_SILENT) != PAM_SUCCESS) {
+        fprintf(stderr, "Access denied.\n");
+        _exit(1);
+      }
       pid_t pid                 = fork();
       switch (pid) {
       case -1:
@@ -1335,9 +1533,8 @@ static void childProcess(struct Service *service, int width, int height,
         // Finish all pending PAM operations.
         int status, rc;
         check(NOINTR(waitpid(pid, &status, 0)) == pid);
-        check((rc               = pam_close_session(pam, PAM_SILENT)) ==
-              PAM_SUCCESS);
-        check(pam_end(pam, rc) == PAM_SUCCESS);
+        rc = pam_close_session(pam, PAM_SILENT);
+        pam_end(pam, rc | PAM_DATA_SILENT);
         _exit(WIFEXITED(status) ? WEXITSTATUS(status) : -WTERMSIG(status));
       }
     }
@@ -1386,7 +1583,11 @@ static void childProcess(struct Service *service, int width, int height,
   _exit(1);
 }
 
-static void sigChildHandler(int sig, siginfo_t *info, void *unused) {
+static void sigChildHandler(int sig ATTR_UNUSED, siginfo_t *info ATTR_UNUSED,
+                            void *unused ATTR_UNUSED) {
+  UNUSED(sig);
+  UNUSED(info);
+  UNUSED(unused);
 }
 
 static void launcherDaemon(int fd) {
@@ -1395,6 +1596,9 @@ static void launcherDaemon(int fd) {
   sa.sa_flags                 = SA_NOCLDSTOP | SA_SIGINFO;
   sa.sa_sigaction             = sigChildHandler;
   check(!sigaction(SIGCHLD, &sa, NULL));
+
+  // pututxline() can cause spurious SIGHUP signals. Better ignore those.
+  signal(SIGHUP, SIG_IGN);
 
   struct LaunchRequest request;
   for (;;) {
@@ -1487,7 +1691,8 @@ static void launcherDaemon(int fd) {
       }
 
       // Send file handle and process id back to parent
-      char cmsg_buf[CMSG_SPACE(sizeof(int))] = { 0 };
+      char cmsg_buf[CMSG_SPACE(sizeof(int))]; // = { 0 }; // Valid initializer makes OSX mad.
+      memset (cmsg_buf, 0, sizeof (cmsg_buf)); // Quiet complaint from valgrind
       struct iovec  iov       = { 0 };
       struct msghdr msg       = { 0 };
       iov.iov_base            = &pid;
@@ -1526,7 +1731,7 @@ int forkLauncher(void) {
     // Temporarily drop most permissions. We still retain the ability to
     // switch back to root, which is necessary for launching "login".
     lowerPrivileges();
-    closeAllFds((int []){ pair[1] }, 1);
+    closeAllFds((int []){ pair[1], 2 }, 2);
     launcherDaemon(pair[1]);
     fatal("exit() failed!");
   case -1:

@@ -1,5 +1,5 @@
 // privileges.c -- Manage process privileges
-// Copyright (C) 2008-2009 Markus Gutschke <markus@shellinabox.com>
+// Copyright (C) 2008-2010 Markus Gutschke <markus@shellinabox.com>
 //
 // This program is free software; you can redistribute it and/or modify
 // it under the terms of the GNU General Public License version 2 as
@@ -63,6 +63,36 @@ int   runAsUser  = -1;
 int   runAsGroup = -1;
 
 
+#ifndef HAVE_GETRESUID
+int getresuid(uid_t *ruid, uid_t *euid, uid_t *suid) {
+  *ruid = getuid();
+  *euid = geteuid();
+  *suid = -1;
+  return 0;
+}
+#endif
+
+#ifndef HAVE_GETRESGID
+int getresgid(gid_t *rgid, gid_t *egid, gid_t *sgid) {
+  *rgid = getgid();
+  *egid = getegid();
+  *sgid = -1;
+  return 0;
+}
+#endif
+
+#ifndef HAVE_SETRESUID
+int setresuid(uid_t ruid, uid_t euid, uid_t suid) {
+  return setreuid(ruid, euid);
+}
+#endif
+
+#ifndef HAVE_SETRESGID
+int setresgid(gid_t rgid, gid_t egid, gid_t sgid) {
+  return setregid(rgid, egid);
+}
+#endif
+
 static void removeGroupPrivileges(int showError) {
   gid_t rg, eg, sg;
   check(!getresgid(&rg, &eg, &sg));
@@ -76,7 +106,7 @@ static void removeGroupPrivileges(int showError) {
     getresuid(&ru, &eu, &su);
 
     // Try to switch the user-provided group.
-    if ((ru && runAsGroup != rg) ||
+    if ((ru && runAsGroup != (int)rg) ||
         setresgid(runAsGroup, runAsGroup, runAsGroup)) {
       if (showError) {
         fatal("Only privileged users can change their group memberships");
@@ -110,7 +140,7 @@ void lowerPrivileges(void) {
 
   if (runAsUser >= 0) {
     // Try to switch to the user-provided user id.
-    if (r && runAsUser != r) {
+    if (r && runAsUser != (int)r) {
       fatal("Only privileged users can change their user id");
     }
     check(!setresuid(runAsUser, runAsUser, -1));
@@ -136,7 +166,7 @@ void dropPrivileges(void) {
 
   if (runAsUser >= 0) {
     // Try to switch to the user-provided user id.
-    if ((r && runAsUser != r) ||
+    if ((r && runAsUser != (int)r) ||
         setresuid(runAsUser, runAsUser, runAsUser)) {
       fatal("Only privileged users can change their user id.");
     }
@@ -244,7 +274,7 @@ uid_t getUserId(const char *name) {
   return uid;
 }
 
-uid_t parseUser(const char *arg, const char **name) {
+uid_t parseUserArg(const char *arg, const char **name) {
   char *end;
   errno           = 0;
   unsigned long l = strtoul(arg, &end, 10);
@@ -374,7 +404,7 @@ gid_t getGroupId(const char *name) {
   return gid;
 }
 
-gid_t parseGroup(const char *arg, const char **name) {
+gid_t parseGroupArg(const char *arg, const char **name) {
   char *end;
   errno           = 0;
   unsigned long l = strtoul(arg, &end, 10);

@@ -1,3 +1,97 @@
+2010-09-11  Markus Gutschke  <markus@shellinabox.com>
+
+	* Added --pidfile= option that can be used even if running in the
+	foreground.
+
+2010-09-04  Markus Gutschke  <markus@shellinabox.com>
+
+	* Added an optional on-screen keyboard. Must be activated by the
+	user by selecting the option in the context-menu.
+
+2010-09-03  Markus Gutschke  <markus@shellinabox.com>
+
+	* Fix some scaling related issues. This fix is thanks to some
+	excellent detective work by Jan <siev...@zedat.fu-berlin.de>.
+
+	* Allow changing of font sizes in the user CSS.
+
+2010-08-19  Markus Gutschke  <markus@shellinabox.com>
+
+	* Thanks to lotr44's excellent analysis of the problem, we now have
+	a fix for the problem with typing "!" on French keyboards.
+
+2010-08-06  Markus Gutschke  <markus@shellinabox.com>
+
+	* Allow users to disable the blinking cursor from the context menu.
+
+2010-07-08  Markus Gutschke  <markus@shellinabox.com>
+
+	* Added support for systems that have utmpx.h, but don't implement
+	updwtmpx().
+
+2010-07-02  Markus Gutschke  <markus@shellinabox.com>
+
+	* Fixed a NULL pointer dereference that can occur when hostnames
+	do not resolve. Thanks to <vmagerya> for pointing out this problem.
+
+2010-03-31  Markus Gutschke  <markus@shellinabox.com>
+
+	* Tweaked the build system to work better on OpenWRT. This is largely
+	thanks to very helpful bug reports, and lots of testing by Jan Jaeger.
+
+2010-03-29  Markus Gutschke  <markus@shellinabox.com>
+
+	* Started working on support for WebSockets.
+
+	* Fixed some compiler warnings when compiling with -Wextra
+
+	* Thanks to Jan Jaeger's excellent bug report, made some changes
+	that should make it easier to build ShellInABox for OpenWRT.
+
+2009-12-10  Markus Gutschke  <markus@shellinabox.com>
+
+	* Add .note.GNU-stack to all object files so that the generated
+	binary doesn't erroneously request an executable stack.
+
+2009-12-03  Markus Gutschke  <markus@shellinabox.com>
+
+	* Allow retrieval of the user's default login shell from
+	/etc/passwd.
+
+	* Allow the code to be built without support for the LOGIN
+	service, as calling /bin/login does not work well on Fedora.
+
+2009-12-02  Markus Gutschke  <markus@shellinabox.com>
+
+	* Added fallback code that dynamically computes the correct commandline
+	arguments for "objcopy" if building for an otherwise unknown target
+	platform.
+
+2009-12-01  Markus Gutschke  <markus@shellinabox.com>
+
+	* Added some basic sanity checks to the commit script that now makes
+	sure we at least attempt to keep copyright dates updated whenever we
+	make changes.
+
+	* Added checks that the debian/changelog file is up-to-date
+
+	* Added debian/watch file
+
+	* Updated the Standards-Version in debian/control. Still need to
+	review whether we are in full compliance, though.
+
+	* Fixed lintian errors.
+
+2009-11-29  Markus Gutschke  <markus@shellinabox.com>
+
+	* Preparations for packaging ShellInABox in a way that makes it
+	easy for Debian package maintainers to pick it up.
+
+2009-11-25  Markus Gutschke  <markus@shellinabox.com>
+
+	* On browsers that support CSS transforms, enable switching between
+	  80 and 132 column mode.
+
 2009-11-21  Markus Gutschke  <markus@shellinabox.com>
 
 	* Updated manual page documenting --user-css

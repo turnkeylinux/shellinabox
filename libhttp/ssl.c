@@ -1,5 +1,5 @@
 // ssl.c -- Support functions that find and load SSL support, if available
-// Copyright (C) 2008-2009 Markus Gutschke <markus@shellinabox.com>
+// Copyright (C) 2008-2010 Markus Gutschke <markus@shellinabox.com>
 //
 // This program is free software; you can redistribute it and/or modify
 // it under the terms of the GNU General Public License version 2 as
@@ -58,11 +58,20 @@
 #include <string.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "libhttp/ssl.h"
 #include "libhttp/httpconnection.h"
 #include "logging/logging.h"
+
+#ifdef HAVE_UNUSED
+#defined ATTR_UNUSED __attribute__((unused))
+#defined UNUSED(x)   do { } while (0)
+#else
+#define ATTR_UNUSED
+#define UNUSED(x)    do { (void)(x); } while (0)
+#endif
 
 #undef pthread_once
 #undef pthread_sigmask
@@ -184,13 +193,20 @@ static int maybeLoadCrypto(void) {
   // it, iff we haven't tried loading it before and iff libssl.so does not
   // work by itself.
   static int crypto;
+  // SHELLINABOX_LIBCRYPTO_SO can be used to select the specific
+  // soname of libcrypto for systems where it is not libcrypto.so.
+  // The feature is currently disabled.
+  const char* path_libcrypto = NULL; // getenv ("SHELLINABOX_LIBCRYPTO_SO");
+  if (path_libcrypto == NULL)
+    path_libcrypto = "libcrypto.so";
+
   if (!crypto++) {
 #ifdef RTLD_NOLOAD
-    if (dlopen("libcrypto.so", RTLD_LAZY|RTLD_GLOBAL|RTLD_NOLOAD))
+    if (dlopen(path_libcrypto, RTLD_LAZY|RTLD_GLOBAL|RTLD_NOLOAD))
       return 1;
     else
 #endif
-      if (dlopen("libcrypto.so", RTLD_LAZY|RTLD_GLOBAL))
+      if (dlopen(path_libcrypto, RTLD_LAZY|RTLD_GLOBAL))
         return 1;
   }
   return 0;
@@ -236,6 +252,12 @@ static void *loadSymbol(const char *lib, const char *fn) {
 }
 
 static void loadSSL(void) {
+  // SHELLINABOX_LIBSSL_SO can be used to select the specific
+  // soname of libssl for systems where it is not libssl.so.
+  // The feature is currently disabled.
+  const char* path_libssl = NULL; // = getenv ("SHELLINABOX_LIBSSL_SO");
+  if (path_libssl == NULL)
+    path_libssl = "libssl.so";
   check(!SSL_library_init);
   struct {
     union {
@@ -288,11 +310,11 @@ static void loadSSL(void) {
     { { &d2i_X509 },                    "d2i_X509" },
     { { &X509_free },                   "X509_free" }
   };
-  for (int i = 0; i < sizeof(symbols)/sizeof(symbols[0]); i++) {
-    if (!(*symbols[i].var = loadSymbol("libssl.so", symbols[i].fn))) {
+  for (unsigned i = 0; i < sizeof(symbols)/sizeof(symbols[0]); i++) {
+    if (!(*symbols[i].var = loadSymbol(path_libssl, symbols[i].fn))) {
       debug("Failed to load SSL support. Could not find \"%s\"",
             symbols[i].fn);
-      for (int j = 0; j < sizeof(symbols)/sizeof(symbols[0]); j++) {
+      for (unsigned j = 0; j < sizeof(symbols)/sizeof(symbols[0]); j++) {
         *symbols[j].var = NULL;
       }
       return;
@@ -339,18 +361,32 @@ static void sslGenerateCertificate(const char *certificate,
                                    const char *serverName) {
  debug("Auto-generating missing certificate \"%s\" for \"%s\"",
        certificate, serverName);
-  char *cmd         = stringPrintf(NULL,
-    "set -e; "
-    "exec 2>/dev/null </dev/null; "
-    "umask 0377; "
-    "PATH=/usr/bin:/usr/sbin "
-    "openssl req -x509 -nodes -days 7300 -newkey rsa:1024 -keyout /dev/stdout "
-                                 "-out /dev/stdout -subj '/CN=%s/' | cat>'%s'",
-    serverName, certificate);
-  if (system(cmd)) {
+
+  pid_t pid = fork();
+  if (pid == -1) {
     warn("Failed to generate self-signed certificate \"%s\"", certificate);
+  } else if (pid == 0) {
+    int fd = NOINTR(open("/dev/null", O_RDONLY));
+    check(fd != -1);
+    check(NOINTR(dup2(fd, STDERR_FILENO)) == STDERR_FILENO);
+    check(NOINTR(close(fd)) == 0);
+    fd = NOINTR(open("/dev/null", O_WRONLY));
+    check(fd != -1);
+    check(NOINTR(dup2(fd, STDIN_FILENO)) == STDIN_FILENO);
+    check(NOINTR(close(fd)) == 0);
+    umask(077);
+    check(setenv("PATH", "/usr/bin:/usr/sbin", 1) == 0);
+    execlp("openssl", "openssl", "req", "-x509", "-nodes", "-days", "7300",
+           "-newkey", "rsa:2048", "-keyout", certificate, "-out", certificate,
+           "-subj", stringPrintf(NULL, "/CN=%s/", serverName),
+           (char *)NULL);
+    check(0);
+  } else {
+    int status;
+    check(NOINTR(waitpid(pid, &status, 0)) == pid);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+      warn("Failed to generate self-signed certificate \"%s\"", certificate);
   }
-  free(cmd);
 }
 
 static const unsigned char *sslSecureReadASCIIFileToMem(int fd) {
@@ -361,7 +397,7 @@ static const unsigned char *sslSecureReadASCIIFileToMem(int fd) {
   check((buf          = malloc(bufSize)) != NULL);
   for (;;) {
     check(len < bufSize - 1);
-    size_t  readLen   = bufSize - len - 1;
+    ssize_t readLen   = bufSize - len - 1;
     ssize_t bytesRead = NOINTR(read(fd, buf + len, readLen));
     if (bytesRead > 0) {
       len            += bytesRead;
@@ -414,7 +450,7 @@ static const unsigned char *sslPEMtoASN1(const unsigned char *pem,
     return NULL;
   }
   unsigned char *ret;
-  size_t maxSize     = (((end - ptr)*6)+7)/8;
+  ssize_t maxSize    = (((end - ptr)*6)+7)/8;
   check((ret         = malloc(maxSize)) != NULL);
   unsigned char *out = ret;
   unsigned bits      = 0;
@@ -466,7 +502,7 @@ static int sslSetCertificateFromFd(SSL_CTX *context, int fd) {
   const unsigned char *data    = sslSecureReadASCIIFileToMem(fd);
   check(!NOINTR(close(fd)));
   long dataSize                = (long)strlen((const char *)data);
-  long certSize, rsaSize, dsaSize, ecSize;
+  long certSize, rsaSize, dsaSize, ecSize, notypeSize;
   const unsigned char *record;
   const unsigned char *cert    = sslPEMtoASN1(data, "CERTIFICATE", &certSize,
                                               &record);
@@ -476,21 +512,26 @@ static int sslSetCertificateFromFd(SSL_CTX *context, int fd) {
                                               NULL);
   const unsigned char *ec      = sslPEMtoASN1(data, "EC PRIVATE KEY",  &ecSize,
                                               NULL);
+  const unsigned char *notype  = sslPEMtoASN1(data, "PRIVATE KEY", &notypeSize,
+                                              NULL);
   if (certSize && (rsaSize || dsaSize
 #ifdef EVP_PKEY_EC
                                       || ecSize
 #endif
-                                               ) &&
+                                                || notypeSize) &&
       SSL_CTX_use_certificate_ASN1(context, certSize, cert) &&
       (!rsaSize ||
        SSL_CTX_use_PrivateKey_ASN1(EVP_PKEY_RSA, context, rsa, rsaSize)) &&
       (!dsaSize ||
-       SSL_CTX_use_PrivateKey_ASN1(EVP_PKEY_DSA, context, dsa, dsaSize))
+       SSL_CTX_use_PrivateKey_ASN1(EVP_PKEY_DSA, context, dsa, dsaSize)) &&
 #ifdef EVP_PKEY_EC
-      &&
       (!ecSize ||
-       SSL_CTX_use_PrivateKey_ASN1(EVP_PKEY_EC, context, ec, ecSize))
+       SSL_CTX_use_PrivateKey_ASN1(EVP_PKEY_EC, context, ec, ecSize)) &&
 #endif
+      // Assume a private key is RSA if the header does not specify a type.
+      // (e.g. BEGIN PRIVATE KEY)
+      (!notypeSize ||
+       SSL_CTX_use_PrivateKey_ASN1(EVP_PKEY_RSA, context, notype, notypeSize))
       ) {
     memset((char *)cert, 0, certSize);
     free((char *)cert);
@@ -526,6 +567,8 @@ static int sslSetCertificateFromFd(SSL_CTX *context, int fd) {
   free((char *)dsa);
   memset((char *)ec, 0, ecSize);
   free((char *)ec);
+  memset((char *)notype, 0, notypeSize);
+  free((char *)notype);
   return rc;
 }
 
@@ -541,7 +584,9 @@ static int sslSetCertificateFromFile(SSL_CTX *context,
 #endif
 
 #ifdef HAVE_TLSEXT
-static int sslSNICallback(SSL *sslHndl, int *al, struct SSLSupport *ssl) {
+static int sslSNICallback(SSL *sslHndl, int *al ATTR_UNUSED,
+                          struct SSLSupport *ssl) {
+  UNUSED(al);
   check(!ERR_peek_error());
   const char *name        = SSL_get_servername(sslHndl,
                                                TLSEXT_NAMETYPE_host_name);
@@ -562,17 +607,13 @@ static int sslSNICallback(SSL *sslHndl, int *al, struct SSLSupport *ssl) {
     } else if (ch != '\000' && ch != '.' && ch != '-' &&
                (ch < '0' ||(ch > '9' && ch < 'A') || (ch > 'Z' &&
                 ch < 'a')|| ch > 'z')) {
-      i++;
-      continue;
+      free(serverName);
+      return SSL_TLSEXT_ERR_OK;
     }
     serverName[++i]       = ch;
     if (!ch) {
       break;
     }
-  }
-  if (!*serverName) {
-    free(serverName);
-    return SSL_TLSEXT_ERR_OK;
   }
   SSL_CTX *context        = (SSL_CTX *)getFromTrie(&ssl->sniContexts,
                                                    serverName+1,
@@ -603,19 +644,21 @@ static int sslSNICallback(SSL *sslHndl, int *al, struct SSLSupport *ssl) {
   }
   free(serverName);
   if (context != ssl->sslContext) {
-    check(SSL_set_SSL_CTX(sslHndl, context) > 0);
+    check(SSL_set_SSL_CTX(sslHndl, context));
   }
   check(!ERR_peek_error());
   return SSL_TLSEXT_ERR_OK;
 }
 #endif
 
-#if defined(HAVE_OPENSSL) && 1
+#if defined(HAVE_OPENSSL) && !defined(HAVE_GETHOSTBYNAME_R)
 // This is a not-thread-safe replacement for gethostbyname_r()
 #define gethostbyname_r x_gethostbyname_r
 static int gethostbyname_r(const char *name, struct hostent *ret,
-                           char *buf, size_t buflen,
+                           char *buf ATTR_UNUSED, size_t buflen ATTR_UNUSED,
                            struct hostent **result, int *h_errnop) {
+  UNUSED(buf);
+  UNUSED(buflen);
   if (result) {
     *result          = NULL;
   }
@@ -626,14 +669,16 @@ static int gethostbyname_r(const char *name, struct hostent *ret,
     return -1;
   }
   struct hostent *he = gethostbyname(name);
-  *ret               = *he;
-  if (result) {
-    *result          = ret;
+  if (he) {
+    *ret             = *he;
+    if (result) {
+      *result        = ret;
+    }
   }
   if (h_errnop) {
     *h_errnop        = h_errno;
   }
-  return 0;
+  return he ? 0 : -1;
 }
 #endif
 
@@ -658,12 +703,15 @@ void sslSetCertificate(struct SSLSupport *ssl, const char *filename,
       char hostname[256], buf[4096];
       check(!gethostname(hostname, sizeof(hostname)));
       struct hostent he_buf, *he;
-      int h_err;
-      if (gethostbyname_r(hostname, &he_buf, buf, sizeof(buf),
-                          &he, &h_err)) {
-        sslGenerateCertificate(defaultCertificate, hostname);
-      } else {
+      int h_err = 0;
+      int ret = gethostbyname_r(hostname, &he_buf, buf, sizeof(buf), &he, &h_err);
+      if (!ret && he && he->h_name) {
         sslGenerateCertificate(defaultCertificate, he->h_name);
+      } else {
+        if (h_err) {
+          warn("Error getting host information: \"%s\".", hstrerror(h_err));
+        }
+        sslGenerateCertificate(defaultCertificate, hostname);
       }
     } else {
       goto valid_certificate;

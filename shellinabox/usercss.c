@@ -1,5 +1,5 @@
 // usercss.c -- Defines user-selectable CSS options
-// Copyright (C) 2008-2009 Markus Gutschke <markus@shellinabox.com>
+// Copyright (C) 2008-2010 Markus Gutschke <markus@shellinabox.com>
 //
 // This program is free software; you can redistribute it and/or modify
 // it under the terms of the GNU General Public License version 2 as
@@ -57,9 +57,21 @@
 #include "shellinabox/usercss.h"
 #include "libhttp/hashmap.h"
 
+#ifdef HAVE_UNUSED
+#defined ATTR_UNUSED __attribute__((unused))
+#defined UNUSED(x)   do { } while (0)
+#else
+#define ATTR_UNUSED
+#define UNUSED(x)    do { (void)(x); } while (0)
+#endif
+
 static struct HashMap *defines;
 
-static void definesDestructor(void *arg, char *key, char *value) {
+static void definesDestructor(void *arg ATTR_UNUSED, char *key,
+                              char *value ATTR_UNUSED) {
+  UNUSED(arg);
+  UNUSED(value);
+
   free(key);
 }
 
@@ -73,7 +85,9 @@ static void readStylesheet(struct UserCSS *userCSS, const char *filename,
   FILE *fp;
   check(fp                = fdopen(fd, "r"));
   check(*style            = malloc(st.st_size + 1));
-  check(fread(*style, 1, st.st_size, fp) == st.st_size);
+  if (st.st_size > 0) {
+    check(fread(*style, st.st_size, 1, fp) == 1);
+  }
   (*style)[st.st_size]    = '\000';
   *len                    = st.st_size;
   fclose(fp);

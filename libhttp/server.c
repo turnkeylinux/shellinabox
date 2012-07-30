@@ -1,5 +1,5 @@
 // server.c -- Generic server that can deal with HTTP connections
-// Copyright (C) 2008-2009 Markus Gutschke <markus@shellinabox.com>
+// Copyright (C) 2008-2010 Markus Gutschke <markus@shellinabox.com>
 //
 // This program is free software; you can redistribute it and/or modify
 // it under the terms of the GNU General Public License version 2 as
@@ -61,12 +61,81 @@
 #include "libhttp/ssl.h"
 #include "logging/logging.h"
 
+#ifdef HAVE_UNUSED
+#defined ATTR_UNUSED __attribute__((unused))
+#defined UNUSED(x)   do { } while (0)
+#else
+#define ATTR_UNUSED
+#define UNUSED(x)    do { (void)(x); } while (0)
+#endif
+
 #define INITIAL_TIMEOUT    (10*60)
 
 // Maximum amount of payload (e.g. form values that have been POST'd) that we
 // read into memory. If the application needs any more than this, the streaming
 // API should be used, instead.
 #define MAX_PAYLOAD_LENGTH (64<<10)
+
+
+#if defined(__APPLE__) && defined(__MACH__)
+// While MacOS X does ship with an implementation of poll(), this
+// implementation is apparently known to be broken and does not comply
+// with POSIX standards. Fortunately, the operating system is not entirely
+// unable to check for input events. We can fall back on calling select()
+// instead. This is generally not desirable, as it is less efficient and
+// has a compile-time restriction on the maximum number of file
+// descriptors. But on MacOS X, that's the best we can do.
+
+int x_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
+  fd_set r, w, x;
+  FD_ZERO(&r);
+  FD_ZERO(&w);
+  FD_ZERO(&x);
+  int maxFd             = -1;
+  for (int i = 0; i < nfds; ++i) {
+    if (fds[i].fd > maxFd) {
+      maxFd = fds[i].fd;
+    } else if (fds[i].fd < 0) {
+      continue;
+    }
+    if (fds[i].events & POLLIN) {
+      FD_SET(fds[i].fd, &r);
+    }
+    if (fds[i].events & POLLOUT) {
+      FD_SET(fds[i].fd, &w);
+    }
+    if (fds[i].events & POLLPRI) {
+      FD_SET(fds[i].fd, &x);
+    }
+  }
+  struct timeval tmoVal = { 0 }, *tmo;
+  if (timeout < 0) {
+    tmo                 = NULL;
+  } else {
+    tmoVal.tv_sec       =  timeout / 1000;
+    tmoVal.tv_usec      = (timeout % 1000) * 1000;
+    tmo                 = &tmoVal;
+  }
+  int numRet            = select(maxFd + 1, &r, &w, &x, tmo);
+  for (int i = 0, n = numRet; i < nfds && n > 0; ++i) {
+    if (fds[i].fd < 0) {
+      continue;
+    }
+    if (FD_ISSET(fds[i].fd, &x)) {
+      fds[i].revents    = POLLPRI;
+    } else if (FD_ISSET(fds[i].fd, &r)) {
+      fds[i].revents    = POLLIN;
+    } else {
+      fds[i].revents    = 0;
+    }
+    if (FD_ISSET(fds[i].fd, &w)) {
+      fds[i].revents   |= POLLOUT;
+    }
+  }
+  return numRet;
+}
+#define poll x_poll
+#endif
 
 time_t currentTime;
 
@@ -128,7 +197,8 @@ static int serverCollectHandler(struct HttpConnection *http, void *handler_) {
 
 }
 
-static void serverDestroyHandlers(void *arg, char *value) {
+static void serverDestroyHandlers(void *arg ATTR_UNUSED, char *value) {
+  UNUSED(arg);
   free(value);
 }
 
@@ -143,6 +213,7 @@ void serverRegisterHttpHandler(struct Server *server, const char *url,
     h->handler          = serverCollectHandler;
     h->arg              = h;
     h->streamingHandler = handler;
+    h->websocketHandler = NULL;
     h->streamingArg     = arg;
     addToTrie(&server->handlers, url, (char *)h);
   }
@@ -158,13 +229,32 @@ void serverRegisterStreamingHttpHandler(struct Server *server, const char *url,
     check(h             = malloc(sizeof(struct HttpHandler)));
     h->handler          = handler;
     h->streamingHandler = NULL;
+    h->websocketHandler = NULL;
     h->streamingArg     = NULL;
     h->arg              = arg;
     addToTrie(&server->handlers, url, (char *)h);
   }
 }
 
-static int serverQuitHandler(struct HttpConnection *http, void *arg) {
+void serverRegisterWebSocketHandler(struct Server *server, const char *url,
+       int (*handler)(struct HttpConnection *, void *, int, const char *, int),
+       void *arg) {
+  if (!handler) {
+    addToTrie(&server->handlers, url, NULL);
+  } else {
+    struct HttpHandler *h;
+    check(h             = malloc(sizeof(struct HttpHandler)));
+    h->handler          = NULL;
+    h->streamingHandler = NULL;
+    h->websocketHandler = handler;
+    h->arg              = arg;
+    addToTrie(&server->handlers, url, (char *)h);
+  }
+}
+
+static int serverQuitHandler(struct HttpConnection *http ATTR_UNUSED,
+                             void *arg) {
+  UNUSED(arg);
   httpSendReply(http, 200, "Good Bye", NO_MSG);
   httpExitLoop(http, 1);
   return HTTP_DONE;
@@ -334,11 +424,25 @@ struct ServerConnection *serverGetConnection(struct Server *server,
                                              int fd) {
   if (hint &&
       server->connections <= hint &&
-      server->connections + server->numConnections > hint &&
-      &server->connections[hint - server->connections] == hint &&
-      !hint->deleted &&
-      server->pollFds[hint - server->connections + 1].fd == fd) {
-    return hint;
+      server->connections + server->numConnections > hint) {
+    // The compiler would like to optimize the expression:
+    //   &server->connections[hint - server->connections]     <=>
+    //   server->connections + hint - server->connections     <=>
+    //   hint
+    // This transformation is correct as far as the language specification is
+    // concerned, but it is unintended as we actually want to check whether
+    // the alignment is correct. So, instead of comparing
+    //   &server->connections[hint - server->connections] == hint
+    // we first use memcpy() to break aliasing.
+    uintptr_t ptr1, ptr2;
+    memcpy(&ptr1, &hint, sizeof(ptr1));
+    memcpy(&ptr2, &server->connections, sizeof(ptr2));
+    int idx = (ptr1 - ptr2)/sizeof(*server->connections);
+    if (&server->connections[idx] == hint &&
+        !hint->deleted &&
+        server->pollFds[hint - server->connections + 1].fd == fd) {
+      return hint;
+    }
   }
   for (int i = 0; i < server->numConnections; i++) {
     if (server->pollFds[i + 1].fd == fd && !server->connections[i].deleted) {
@@ -349,7 +453,7 @@ struct ServerConnection *serverGetConnection(struct Server *server,
 }
 
 short serverConnectionSetEvents(struct Server *server,
-                                struct ServerConnection *connection,
+                                struct ServerConnection *connection, int fd,
                                 short events) {
   dcheck(server);
   dcheck(connection);
@@ -359,6 +463,7 @@ short serverConnectionSetEvents(struct Server *server,
   dcheck(!connection->deleted);
   int   idx                       = connection - server->connections;
   short oldEvents                 = server->pollFds[idx + 1].events;
+  dcheck(fd == server->pollFds[idx + 1].fd);
   server->pollFds[idx + 1].events = events;
   return oldEvents;
 }
@@ -434,7 +539,7 @@ void serverLoop(struct Server *server) {
     currentTime                           = time(&lastTime);
     int isTimeout                         = timeout >= 0 &&
                                             timeout/1000 <= lastTime;
-    if (server->pollFds[0].revents) {
+    if (eventCount > 0 && server->pollFds[0].revents) {
       eventCount--;
       if (server->pollFds[0].revents && POLLIN) {
         struct sockaddr_in clientAddr;
@@ -479,12 +584,13 @@ void serverLoop(struct Server *server) {
           eventCount--;
         }
         short events                      = server->pollFds[i].events;
+        short oldEvents                   = events;
         if (!connection->handleConnection(connection, connection->arg,
                                          &events, server->pollFds[i].revents)){
           connection                      = server->connections + i - 1;
           connection->destroyConnection(connection->arg);
           connection->deleted             = 1;
-        } else {
+        } else if (events != oldEvents) {
           server->pollFds[i].events       = events;
         }
       }

@@ -1,6 +1,6 @@
 '\" t
 .\" shellinaboxd.man -- Make command line applications available as AJAX web applications
-.\" Copyright (C) 2008-2009 Markus Gutschke <markus@shellinabox.com>
+.\" Copyright (C) 2008-2010 Markus Gutschke <markus@shellinabox.com>
 .\"
 .\" This program is free software; you can redistribute it and/or modify
 .\" it under the terms of the GNU General Public License version 2 as
@@ -44,7 +44,7 @@
 .\" The most up-to-date version of this program is always available from
 .\" http://shellinabox.com
 .\"
-.TH SHELLINABOXD 1 "Nov 21, 2009"
+.TH SHELLINABOXD 1 "Sep 11, 2010"
 .SH NAME
 shellinaboxd \- publish command line shell through AJAX interface
 .SH SYNOPSIS
@@ -65,6 +65,7 @@ shellinaboxd \- publish command line shell through AJAX interface
 [\ \fB--localhost-only\fP\ ]
 [\ \fB--no-beep\fP\ ]
 [\ \fB-n\fP\ | \fB--numeric\fP\ ]
+[\ \fB--pidfile=\fP\fIpidfile\fP\ ]
 [\ \fB-p\fP\ | \fB--port=\fP\fIport\fP\ ]
 [\ \fB-s\fP\ | \fB--service=\fP\fIservice\fP\ ]
 #ifdef HAVE_OPENSSL
@@ -188,7 +189,8 @@ should be configured to pass through the firewall.
 The
 .B --cgi
 option is mutually exclusive with the
-.B --background
+.BR --background ,
+.B --pidfile
 and
 .B --port
 options.
@@ -312,6 +314,12 @@ By default, host names of peers get resolved
 before logging them. As DNS look-ups can be expensive, it is possible
 to request logging of numeric IP addresses, instead.
 .TP
+\fB--pidfile=\fP\fIpidfile\fP
+The
+.B shellinaboxd
+daemon can be configured to store its process identifier in
+.IR pidfile .
+.TP
 \fB-p\fP\ |\ \fB--port=\fP\fIport\fP
 Unless overridden by this option, the web server listens on port 4200
 for incoming HTTP and HTTPS requests.
@@ -330,6 +338,7 @@ One or more services can be registered on different URL paths:
 \fISERVICE\fP := <url-path> ':' \fIAPPLICATION\fP
 .in
 
+#ifdef HAVE_BIN_LOGIN
 There is a pre-defined \fIapplication\fP, 'LOGIN', which causes the
 daemon to invoke
 .B /bin/login
@@ -343,12 +352,34 @@ was defined. Starting
 requires
 .B root
 privileges.
+#endif
 
-There is another pre-defined \fIapplication\fP, 'SSH'. Instead of invoking
+There is
+#ifdef HAVE_BIN_LOGIN
+another
+#endif
+#ifndef HAVE_BIN_LOGIN
+a
+#endif
+pre-defined \fIapplication\fP, 'SSH'.
+#ifdef HAVE_BIN_LOGIN
+Instead of invoking
 .BR /bin/login ,
-it calls
+it
+#endif
+#ifndef HAVE_BIN_LOGIN
+It
+#endif
+calls
 .BR ssh .
-This is the default option for unprivileged users, if no
+This is the default
+#ifdef HAVE_BIN_LOGIN
+option for unprivileged users,
+#endif
+#ifndef HAVE_BIN_LOGIN
+option,
+#endif
+if no
 .B --service
 was defined. This operation is available to both privileged and regular
 users. If the optional \fIhost\fP parameter is omitted,
@@ -359,7 +390,12 @@ connects to
 Alternatively, an \fIapplication\fP can be specified by providing a
 \fIuser\fP description, a working directory, and a command line:
 .in +4
-\fIAPPLICATION\fP := 'LOGIN' | 'SSH' [ ':' <host> ] |  \fIUSER\fP ':' \fICWD\fP ':' <cmdline>
+#ifdef HAVE_BIN_LOGIN
+\fIAPPLICATION\fP := 'LOGIN' | 'SSH' [ ':' <host> ] |  \fIUSER\fP ':' \fICWD\fP ':' \fICMD\fP
+#endif
+#ifndef HAVE_BIN_LOGIN
+\fIAPPLICATION\fP := 'SSH' [ ':' <host> ] |  \fIUSER\fP ':' \fICWD\fP ':' \fICMD\fP
+#endif
 
 #ifdef HAVE_PAM
 .in
@@ -381,6 +417,14 @@ The working directory can either be given as an absolute path, or it
 can be the user's home directory:
 .in +4
 \fICWD\fP := 'HOME' : <dir>
+.in
+
+The command that
+.B shellinaboxd
+executes can either be specified as the 'SHELL' keyword, denoting the user's
+default login shell, or an arbitrary command line:
+.in +4
+\fICMD\fP := 'SHELL' : <cmdline>
 .in
 
 The <cmdline> supports expansion of variables of the form ${VAR}.
@@ -762,7 +806,7 @@ and
 .B --user
 options should be used to change to a dedicated user.
 .SH AUTHOR
-Copyright (C) 2008-2009 by Markus Gutschke
+Copyright (C) 2008-2010 by Markus Gutschke
 .RI < "markus@shellinabox.com" >.
 .P
 This program is free software; you can redistribute it and/or modify

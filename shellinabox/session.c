@@ -1,5 +1,5 @@
 // session.c -- Session management for HTTP/HTTPS connections
-// Copyright (C) 2008-2009 Markus Gutschke <markus@shellinabox.com>
+// Copyright (C) 2008-2010 Markus Gutschke <markus@shellinabox.com>
 //
 // This program is free software; you can redistribute it and/or modify
 // it under the terms of the GNU General Public License version 2 as
@@ -53,6 +53,14 @@
 
 #include "shellinabox/session.h"
 #include "logging/logging.h"
+
+#ifdef HAVE_UNUSED
+#defined ATTR_UNUSED __attribute__((unused))
+#defined UNUSED(x)   do { } while (0)
+#else
+#define ATTR_UNUSED
+#define UNUSED(x)    do { (void)(x); } while (0)
+#endif
 
 static HashMap *sessions;
 
@@ -152,7 +160,11 @@ void finishAllSessions(void) {
   deleteHashMap(sessions);
 }
 
-static void destroySessionHashEntry(void *arg, char *key, char *value) {
+static void destroySessionHashEntry(void *arg ATTR_UNUSED,
+                                    char *key ATTR_UNUSED, char *value) {
+  UNUSED(arg);
+  UNUSED(key);
+
   deleteSession((struct Session *)value);
 }
 
@@ -167,7 +179,7 @@ char *newSessionKey(void) {
   char *ptr          = sessionKey;
   int count          = 0;
   int bits           = 0;
-  for (int i = 0;;) {
+  for (unsigned i = 0;;) {
     bits             = (bits << 8) | buf[i];
     count           += 8;
   drain:

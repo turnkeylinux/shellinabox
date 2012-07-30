@@ -1,5 +1,5 @@
 // server.h -- Generic server that can deal with HTTP connections
-// Copyright (C) 2008-2009 Markus Gutschke <markus@shellinabox.com>
+// Copyright (C) 2008-2010 Markus Gutschke <markus@shellinabox.com>
 //
 // This program is free software; you can redistribute it and/or modify
 // it under the terms of the GNU General Public License version 2 as
@@ -93,6 +93,9 @@ void serverRegisterHttpHandler(struct Server *server, const char *url,
 void serverRegisterStreamingHttpHandler(struct Server *server, const char *url,
                                int (*handler)(struct HttpConnection *, void *),
                                void *arg);
+void serverRegisterWebSocketHandler(struct Server *server, const char *url,
+       int (*handler)(struct HttpConnection *, void *, int, const char *, int),
+       void *arg);
 struct ServerConnection *serverAddConnection(struct Server *server, int fd,
                             int (*handleConnection)(struct ServerConnection *c,
                                                     void *arg, short *events,
@@ -106,7 +109,7 @@ struct ServerConnection *serverGetConnection(struct Server *server,
                                              struct ServerConnection *hint,
                                              int fd);
 short serverConnectionSetEvents(struct Server *server,
-                                struct ServerConnection *connection,
+                                struct ServerConnection *connection, int fd,
                                 short events);
 void serverExitLoop(struct Server *server, int exitAll);
 void serverLoop(struct Server *server);
