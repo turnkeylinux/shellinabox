@@ -23,6 +23,8 @@ override_dh_auto_configure:
 # elf-2012.03.24: This work should be done in the Makefile install
 #		  target instead of debian/rules.
 DESTDIR=$(CURDIR)/debian/tmp
+STYLES_SRC=$(DESTDIR)/usr/share/doc/shellinabox
+STYLES_DST=$(DESTDIR)/etc/shellinabox/options-available
 override_dh_install:
 	dh_testdir
 	dh_testroot
@@ -33,24 +35,14 @@ override_dh_install:
 # debian/tmp the things that need to be included in the package.
 	$(MAKE) install DESTDIR=$(DESTDIR)
 # Set up system-wide user CSS style options
-	mkdir -p "$(DESTDIR)/etc/shellinabox/options-available"
-	mkdir -p "$(DESTDIR)/etc/shellinabox/options-enabled"
-	for i in \
-		"00+Black on White" \
-		"00_White On Black" \
-		"01_Monochrome" \
-		"01+Color Terminal"; do \
-	  cp "$(DESTDIR)/usr/share/doc/shellinabox/$$(echo "$$i"|	\
-		sed -e 's/[0-9]*[_+]\([^ ]*\).*/\1/'| 			\
-		tr A-Z a-z)"*.css                     			\
-	     "$(DESTDIR)/etc/shellinabox/options-available/$$i.css";	\
-	done
-	cd "$(DESTDIR)/etc/shellinabox/options-enabled" \
-	  && ln -s ../options-available/*.css .
-	cp "$(CURDIR)/debian/README.available"                                \
-	   "$(DESTDIR)/etc/shellinabox/options-available/README"
-	cp "$(CURDIR)/debian/README.enabled"                                  \
-	   "$(DESTDIR)/etc/shellinabox/options-enabled/README"
+	mkdir -p $(DESTDIR)/etc/shellinabox/options-available
+	mkdir -p $(DESTDIR)/etc/shellinabox/options-enabled
+	cp $(DESTDIR)/usr/share/doc/shellinabox/*.css                      \
+	   $(DESTDIR)/etc/shellinabox/options-available
+	cp $(CURDIR)/debian/README.available                                \
+	   $(DESTDIR)/etc/shellinabox/options-available/README
+	cp $(CURDIR)/debian/README.enabled                                  \
+	   $(DESTDIR)/etc/shellinabox/options-enabled/README
 # Shellinabox home directory
 #	mkdir -p "$(DESTDIR)/var/lib/shellinabox"
 # Add Lintian override. ShellInABox has an explicit exemption allowing
