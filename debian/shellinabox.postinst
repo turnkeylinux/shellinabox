@@ -25,6 +25,14 @@ case "$1" in
           --home /var/lib/shellinabox --gecos "Shell In A Box" \
           --group shellinabox
       fi
+      # create default styles unless already configured
+      if ! ls /etc/shellinabox/options-enabled/*.css >/dev/null 2>&1; then
+        cd /etc/shellinabox/options-enabled
+        ln -s ../options-available/black-on-white.css 00_Black-on-White.css
+        ln -s ../options-available/white-on-black.css 00+White-on-Black.css
+        ln -s ../options-available/monochrome.css 01_Monochrome.css
+        ln -s ../options-available/color.css 01+Color.css
+      fi
 	# Shellinabox must own the certificate directory so that it
 	# can write the certificate even when the daemon has given-up
 	# root privileges.
