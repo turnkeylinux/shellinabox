@@ -20,3 +20,8 @@
 #vt100 .bgAnsi0 {
   background-color: #ffffff;
 }
+
+#vt100 .ansi0.bgAnsi7 {
+  color: black;
+}
+
