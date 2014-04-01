@@ -971,6 +971,13 @@ VT100.prototype.initializeElements = function(container) {
                                   document.documentElement.clientWidth ||
                                   document.body.clientWidth) -
                                  marginRight != x + this.container.offsetWidth;
+
+  // https://code.google.com/p/shellinabox/issues/detail?id=64
+  var isMobile = navigator.userAgent.match(/iPad|iPhone|iPod/i) != null;
+  if (isMobile) {
+    this.isEmbedded = false;
+  }
+
   if (!this.isEmbedded) {
     // Some browsers generate resize events when the terminal is first
     // shown. Disable showing the size indicator until a little bit after
